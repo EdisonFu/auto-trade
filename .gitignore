@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# 运行时数据:含账户信息、委托记录,绝不入库
+state/
