@@ -41,6 +41,28 @@ class AXError(Exception):
     pass
 
 
+def wait_until(cond, timeout: float = 3.0, interval: float = 0.04,
+               settle: float = 0.0):
+    """轮询直到 cond() 返回真值,返回该值;超时返回 None。
+
+    替代固定 sleep: 条件达成就立刻继续(通常几十毫秒),
+    机器卡顿时自动多等,比盲等既快又稳。
+    """
+    deadline = time.time() + timeout
+    while True:
+        try:
+            val = cond()
+        except Exception:
+            val = None
+        if val:
+            if settle:
+                time.sleep(settle)
+            return val
+        if time.time() >= deadline:
+            return None
+        time.sleep(interval)
+
+
 def redact(text: str) -> str:
     """脱敏:股东账号等账户标识不应进入日志或报告。"""
     import re
@@ -128,12 +150,20 @@ class ThsAX:
     # ------------------------------------------------------------------
     # 进程 / 窗口
     # ------------------------------------------------------------------
-    def activate(self) -> None:
+    def activate(self, timeout: float = 3.0) -> None:
+        """激活同花顺并等它真正到前台(轮询,不盲等)。"""
         subprocess.run(
             ["osascript", "-e", f'tell application id "{BUNDLE_ID}" to activate'],
             capture_output=True,
         )
-        time.sleep(1.2)
+
+        def is_front():
+            for app in NSWorkspace.sharedWorkspace().runningApplications():
+                if app.bundleIdentifier() == BUNDLE_ID:
+                    return app.isActive()
+            return False
+
+        wait_until(is_front, timeout=timeout, interval=0.03, settle=0.08)
 
     def _pid(self) -> int:
         for app in NSWorkspace.sharedWorkspace().runningApplications():
@@ -141,21 +171,79 @@ class ThsAX:
                 return app.processIdentifier()
         raise AXError("同花顺未运行")
 
-    def window(self, retries: int = 12):
+    @staticmethod
+    def _onscreen_windows() -> int:
+        """同花顺在屏窗口数。为 0 说明窗口被关掉了(Mac 关窗不退进程)。"""
+        try:
+            import Quartz
+        except ImportError:
+            return -1
+        wins = Quartz.CGWindowListCopyWindowInfo(
+            Quartz.kCGWindowListOptionOnScreenOnly
+            | Quartz.kCGWindowListExcludeDesktopElements,
+            Quartz.kCGNullWindowID,
+        ) or []
+        return sum(1 for w in wins
+                   if "同花顺" in str(w.get("kCGWindowOwnerName", "")))
+
+    def _reopen_main_window(self) -> None:
+        """窗口被关时重新唤出主窗口。
+
+        Mac 上关闭窗口不会退出应用,此时 AX 树恒为空。再怎么 activate
+        也没用,必须让应用重新开窗 —— 等价于点 Dock 图标。
+        """
+        subprocess.run(
+            ["osascript", "-e",
+             f'tell application id "{BUNDLE_ID}" to activate',
+             "-e", 'tell application "System Events" to tell process "同花顺" '
+                   'to perform action "AXRaise" of window 1'],
+            capture_output=True,
+        )
+        wait_until(lambda: self._onscreen_windows() > 0,
+                   timeout=4.0, interval=0.1, settle=0.3)
+
+    def window(self, timeout: float = 5.0):
+        """取主窗口。失焦时 AX 树会塌缩,故轮询而非盲等。"""
         app = AXUIElementCreateApplication(self._pid())
-        for attempt in range(retries):
+
+        def ready():
             wins = attr(app, "AXWindows") or []
-            if wins and (attr(wins[0], "AXChildren") or []):
-                return wins[0]
-            if attempt == 0:
-                self.activate()
-            else:
-                time.sleep(0.4)
-        raise AXError("无法获取窗口(AX 树为空;请确认同花顺未最小化)")
+            return wins[0] if wins and (attr(wins[0], "AXChildren") or []) else None
+
+        win = ready()
+        if win is not None:
+            return win
+
+        self.activate()
+        win = wait_until(ready, timeout=timeout)
+        if win is not None:
+            return win
+
+        # 还是空 —— 多半是窗口被关掉了,尝试唤回
+        if self._onscreen_windows() == 0:
+            self._reopen_main_window()
+            win = wait_until(ready, timeout=timeout)
+            if win is not None:
+                return win
+            raise AXError(
+                "同花顺进程在运行但没有窗口,自动唤回失败。"
+                "请点 Dock 里的同花顺图标,或用菜单「窗口 → 主窗口」打开主界面。"
+            )
+        raise AXError("AX 树为空,请确认同花顺窗口未最小化且已加载完成")
 
     # ------------------------------------------------------------------
     # 面板定位
     # ------------------------------------------------------------------
+    def _try_panel(self):
+        try:
+            return self.find_panel()
+        except AXError:
+            return None
+
+    def _panel_direction(self) -> str | None:
+        p = self._try_panel()
+        return p.direction if p else None
+
     def find_panel(self) -> Panel:
         win = self.window()
         kids = attr(win, "AXChildren") or []
@@ -268,25 +356,46 @@ class ThsAX:
         for down in (True, False):
             ev = Quartz.CGEventCreateKeyboardEvent(self._src, keycode, down)
             Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
-        time.sleep(self.key_delay)
+        if self.key_delay:
+            time.sleep(self.key_delay)
 
     def focus(self, element) -> None:
         err = AXUIElementSetAttributeValue(element, "AXFocused", True)
         if err != 0:
             raise AXError(f"聚焦失败 (AXError={err})")
-        time.sleep(0.35)
+        wait_until(lambda: attr(element, "AXFocused"),
+                   timeout=1.0, interval=0.02, settle=0.03)
 
-    def type_text(self, element, text: str, clear_first: bool = True) -> None:
-        """聚焦后用真实键盘事件输入。不要用 AXValue —— 应用层收不到。"""
+    def type_text(self, element, text: str, clear_first: bool = True,
+                  verify: bool = True) -> None:
+        """聚焦后用真实键盘事件输入。不要用 AXValue —— 应用层收不到。
+
+        清空与落值都用轮询确认,不盲等:
+          * 退格按到框空为止,而不是固定敲 12 次;
+          * 输入后轮询读回,值对了立刻返回。
+        """
         self.focus(element)
-        if clear_first:
-            for _ in range(12):
+
+        if clear_first and self.read(element):
+            for _ in range(16):
                 self._key(_KEYCODE["\b"])
+                if not self.read(element):
+                    break
+
         for ch in text:
             if ch not in _KEYCODE:
                 raise AXError(f"不支持的字符: {ch!r}")
             self._key(_KEYCODE[ch])
-        time.sleep(self.settle)
+
+        if verify:
+            # 读回只能证明控件显示对了,不能证明应用层收到 —— 后者由
+            # read_state() 的联动字段判断。这里只用来省掉固定 settle。
+            if wait_until(lambda: self.read(element) == text,
+                          timeout=max(self.settle * 4, 1.0),
+                          interval=0.02) is None:
+                time.sleep(self.settle)
+        else:
+            time.sleep(self.settle)
 
     def press(self, element) -> None:
         err = AXUIElementPerformAction(element, "AXPress")
@@ -298,7 +407,10 @@ class ThsAX:
         if panel.reset is None:
             return False
         self.press(panel.reset)
-        time.sleep(0.8)
+        wait_until(lambda: not (self.read(panel.code)
+                                or self.read(panel.price)
+                                or self.read(panel.amount)),
+                   timeout=1.5, interval=0.03)
         return True
 
     # ------------------------------------------------------------------
@@ -350,7 +462,9 @@ class ThsAX:
             raise AXError("未找到二次确认框")
         text = dlg["text"]
         self.press(dlg["confirm"])
-        time.sleep(1.2)
+        # 确认框消失即视为该步完成,不必盲等满 1.2s
+        wait_until(lambda: self.find_confirm_dialog() is None,
+                   timeout=3.0, interval=0.05, settle=0.1)
         return text
 
     def cancel_order_dialog(self) -> str:
@@ -362,7 +476,8 @@ class ThsAX:
         if "cancel" not in dlg:
             raise AXError("确认框无[取消]按钮")
         self.press(dlg["cancel"])
-        time.sleep(0.8)
+        wait_until(lambda: self.find_confirm_dialog() is None,
+                   timeout=2.0, interval=0.05)
         return text
 
     # ------------------------------------------------------------------
@@ -379,7 +494,10 @@ class ThsAX:
             _x, y, _w, _h = geom(el)
             if 360 <= y <= 390:
                 self.press(el)
-                time.sleep(1.5)
+                wait_until(lambda: any(
+                    "委托" in str(attr(c, "AXTitle") or "")
+                    for c in (attr(self.window(), "AXChildren") or [])
+                ), timeout=2.5, interval=0.05, settle=0.2)
                 return
         raise AXError("未找到[委托]页签")
 
@@ -442,7 +560,8 @@ class ThsAX:
                     f"请人工处理: {redact(text)[:120]}"
                 )
             self.press(dlg["cancel"])
-            time.sleep(0.8)
+            wait_until(lambda: self.find_confirm_dialog() is None,
+                       timeout=2.0, interval=0.05)
             dismissed.append(text)
         return dismissed
 
@@ -473,7 +592,9 @@ class ThsAX:
             _x, y, _w, _h = geom(el)
             if 100 <= y <= 130:          # 方向 tab 行
                 self.press(el)
-                time.sleep(1.0)
+                # 轮询到面板方向真的切过去
+                wait_until(lambda: self._panel_direction() == want,
+                           timeout=2.5, interval=0.04)
                 break
 
         panel = self.find_panel()
@@ -553,9 +674,8 @@ class ThsAX:
                     self.press(el)
                 except AXError:
                     continue
-                time.sleep(1.6)
-                try:
-                    return self.find_panel()
-                except AXError:
-                    continue
+                panel = wait_until(self._try_panel, timeout=2.5, interval=0.06)
+                if panel is not None:
+                    return panel
+                continue
         raise AXError("逐个点击左侧导航后仍未进入下单页,请手动打开交易界面")

@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import date
 from enum import Enum
 
-from .ax import AXError, Panel, PanelState, ThsAX, redact
+from .ax import AXError, Panel, PanelState, ThsAX, redact, wait_until
 from .config import Config
 
 
@@ -134,6 +134,24 @@ class Trader:
 
             st = self.ax.read_state(panel)
 
+            # 涨跌停校验:超出范围会被交易所废单,提前拦住
+            if self.cfg.check_price_limit:
+                for label, bound in (("涨停", st.limit_up), ("跌停", st.limit_down)):
+                    try:
+                        limit = float(str(bound).strip())
+                    except (TypeError, ValueError):
+                        continue
+                    if label == "涨停" and price > limit + 1e-9:
+                        msg = f"价格 {price_str} 高于涨停价 {limit},交易所将废单"
+                        self.log.error(msg)
+                        return Result(Status.BLOCKED, side, code, price_str,
+                                      amount_str, st, msg)
+                    if label == "跌停" and price < limit - 1e-9:
+                        msg = f"价格 {price_str} 低于跌停价 {limit},交易所将废单"
+                        self.log.error(msg)
+                        return Result(Status.BLOCKED, side, code, price_str,
+                                      amount_str, st, msg)
+
             # 可用量校验:买入看"可买",卖出看"可用"
             avail = st.available_qty
             if avail is not None and amount > avail:
@@ -162,9 +180,10 @@ class Trader:
             import time
             self.log.info("点击[%s]", panel.submit_title)
             self.ax.press(panel.submit)
-            time.sleep(self.cfg.post_submit_wait)
-
-            dlg = self.ax.find_confirm_dialog()
+            # 轮询确认框出现,不盲等 —— 通常 200~400ms 就弹出来了
+            dlg = wait_until(self.ax.find_confirm_dialog,
+                             timeout=max(self.cfg.post_submit_wait * 2, 3.0),
+                             interval=0.05)
             if dlg is None:
                 msg = "点击后未出现二次确认框,状态不明,请人工核对"
                 self.log.error(msg)
@@ -206,7 +225,6 @@ class Trader:
             self._save()
 
             # 6) 回查委托表 —— 唯一可信的成功判据
-            time.sleep(1.5)
             try:
                 self.ax.open_orders_tab()
                 orders = self.ax.read_orders()

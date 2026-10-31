@@ -9,6 +9,7 @@ class Config:
     require_recognized: bool = True # 必须确认同花顺已识别股票才允许提交
     allow_price_override: bool = False  # 同花顺改写价格时是否容忍
     auto_confirm: bool = False      # 是否自动点二次确认框的[确认]
+    check_price_limit: bool = True  # 下单前校验价格是否在涨跌停区间内
     strict_params: bool = True      # 严格模式:代码/价格/数量/方向一律按入参执行,
                                     # 任何一项与界面实际值不符即拒绝提交,绝不替换
 
@@ -19,8 +20,8 @@ class Config:
     stock_whitelist: list[str] = field(default_factory=list)
 
     # ---- 时序 ----
-    settle: float = 0.3
-    key_delay: float = 0.08
+    settle: float = 0.3      # 轮询失败时的兜底等待
+    key_delay: float = 0.03  # 按键间隔;过小可能丢键,实测 0.03 稳定
     post_submit_wait: float = 1.5
 
     # ---- 落盘 ----
