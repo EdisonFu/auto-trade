@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import os
 from dataclasses import dataclass
 from datetime import date
@@ -122,6 +123,12 @@ class Trader:
             # 联动是异步的(要回服务端查名称/涨跌停),填完立刻读会得到空值,
             # 故轮询等到 recognized 或超时。
             self.ax.type_text(panel.code, code)
+            # 页面重建后旧引用写入会静默失败(值进不去也不报错),
+            # 检测到没写进去就重新定位面板再试一次。
+            if (self.ax.read(panel.code) or "").strip() != code:
+                self.log.debug("代码未写入, 重新定位面板")
+                panel = self.ax.reset_to_order_page(side)
+                self.ax.type_text(panel.code, code)
             st = wait_until(
                 lambda: (lambda x: x if x.recognized else None)(
                     self.ax.read_state(panel)),
@@ -271,25 +278,38 @@ class Trader:
             return Result(Status.ERROR, side, code, price_str, amount_str,
                           msg=str(exc))
 
+    @staticmethod
+    def _match_order(orders: list[dict], e: dict):
+        want = "买入" if e["side"] == "buy" else "卖出"
+        return next((o for o in orders
+                     if str(o.get("证券代码", "")).strip() == e["code"]
+                     and want in str(o.get("操作", ""))
+                     and str(o.get("委托数量", "")).strip() == str(e["amount"])),
+                    None)
+
     def verify_orders(self, expect: list[dict]) -> list[dict]:
         """批次末统一回查委托表。expect: [{side,code,amount}]。
 
         返回每项的核对结果 {side,code,amount,found,order}。
         """
-        try:
-            self.ax.open_orders_tab()
-            orders = self.ax.read_orders()
-        except AXError as exc:
-            self.log.warning("委托表回查失败: %s", exc)
-            orders = []
+        # 委托表刷新有延迟(实测可达2s), 轮询到全部命中或超时
+        orders = []
+        deadline = time.time() + 5.0
+        while True:
+            try:
+                self.ax.open_orders_tab()
+                orders = self.ax.read_orders()
+            except AXError as exc:
+                self.log.warning("委托表回查失败: %s", exc)
+                orders = []
+            missing = [e for e in expect
+                       if not self._match_order(orders, e)]
+            if not missing or time.time() >= deadline:
+                break
+            time.sleep(0.5)
         out = []
         for e in expect:
-            want = "买入" if e["side"] == "buy" else "卖出"
-            hit = next((o for o in orders
-                        if str(o.get("证券代码", "")).strip() == e["code"]
-                        and want in str(o.get("操作", ""))
-                        and str(o.get("委托数量", "")).strip() == str(e["amount"])),
-                       None)
+            hit = self._match_order(orders, e)
             out.append({**e, "found": hit is not None, "order": hit})
         return out
 

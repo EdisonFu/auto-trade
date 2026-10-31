@@ -393,7 +393,13 @@ class ThsAX:
             if wait_until(lambda: self.read(element) == text,
                           timeout=max(self.settle * 4, 1.0),
                           interval=0.02) is None:
-                time.sleep(self.settle)
+                # 键盘路径失败(多见于退格没清干净导致新值追加不进去):
+                # 回退到 AXValue 直写。实测同花顺能收到并触发联动,
+                # 仍以 read_state() 的联动字段作为最终判据。
+                AXUIElementSetAttributeValue(element, "AXValue", text)
+                if wait_until(lambda: self.read(element) == text,
+                              timeout=1.0, interval=0.02) is None:
+                    time.sleep(self.settle)
         else:
             time.sleep(self.settle)
 
