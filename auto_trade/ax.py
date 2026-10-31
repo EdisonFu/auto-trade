@@ -574,6 +574,20 @@ class ThsAX:
           3. 点[重填]清空代码/价格/数量 —— 残留值会让下一单
              误用上一单的数量或价格。
         """
+        # dismiss_dialogs 要遍历全部 AX 节点(约0.25s, 首次冷启动3.5s),
+        # 连续下单时绝大多数情况没有遗留对话框; 故先看是否已在干净的
+        # 目标方向下单页, 是则跳过清理与导航, 直接重填。
+        try:
+            cur = self.find_panel()
+            want0 = "买入" if side == "buy" else "卖出"
+            if cur.direction == want0 and self.find_confirm_dialog() is None:
+                # reset 返回 False 说明[重填]没清干净(上一单残留),
+                # 此时必须走完整归位, 否则下一单会填进脏面板导致联动失败。
+                if self.reset(cur):
+                    return cur
+        except AXError:
+            pass
+
         self.dismiss_dialogs()
 
         # 用户可能停在行情/涨停/基金等任意页面,先确保回到交易页

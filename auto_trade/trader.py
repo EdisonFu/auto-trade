@@ -103,7 +103,7 @@ class Trader:
 
     def place(
         self, side: str, code: str, price: float, amount: int,
-        submit: bool | None = None,
+        submit: bool | None = None, verify: bool = True,
     ) -> Result:
         """下单。submit=None 时取 cfg.dry_run 的反值。"""
         do_submit = (not self.cfg.dry_run) if submit is None else submit
@@ -119,8 +119,16 @@ class Trader:
             panel = self.switch(side)
 
             # 1) 代码 —— 必须先填,同花顺据此联动
+            # 联动是异步的(要回服务端查名称/涨跌停),填完立刻读会得到空值,
+            # 故轮询等到 recognized 或超时。
             self.ax.type_text(panel.code, code)
-            st = self.ax.read_state(panel)
+            st = wait_until(
+                lambda: (lambda x: x if x.recognized else None)(
+                    self.ax.read_state(panel)),
+                timeout=self.cfg.recognize_timeout, interval=0.08,
+            )
+            if st is None:
+                st = self.ax.read_state(panel)
             if self.cfg.require_recognized and not st.recognized:
                 msg = f"同花顺未识别 {code}(联动字段为空),拒绝提交"
                 self.log.error(msg + " | " + st.summary())
@@ -225,6 +233,11 @@ class Trader:
             self._save()
 
             # 6) 回查委托表 —— 唯一可信的成功判据
+            # verify=False 时跳过(批量下单由调用方在末尾统一回查): 开/读委托表
+            # 再切回下单页约 0.9s/单, 逐单做会让 3 单多花近 3 秒。
+            if not verify:
+                return Result(Status.SUBMITTED, side, code, price_str,
+                              amount_str, st, "已确认(未回查,待批次末核对)")
             try:
                 self.ax.open_orders_tab()
                 orders = self.ax.read_orders()
@@ -237,8 +250,12 @@ class Trader:
                     self.ax.reset_to_order_page(side)
                 except AXError as exc:
                     self.log.warning("页面归位失败(下一单前请人工检查): %s", exc)
+            # 匹配须同时核对方向与数量, 否则会撞上同一代码的历史委托
+            want_side = "买入" if side == "buy" else "卖出"
             matched = [o for o in orders
-                       if code in " ".join(str(v) for v in o.values())]
+                       if str(o.get("证券代码", "")).strip() == code
+                       and want_side in str(o.get("操作", ""))
+                       and str(o.get("委托数量", "")).strip() == amount_str]
             if matched:
                 return Result(Status.SUBMITTED, side, code, price_str,
                               amount_str, None,
@@ -253,6 +270,28 @@ class Trader:
             self.log.error("AX 异常: %s", exc)
             return Result(Status.ERROR, side, code, price_str, amount_str,
                           msg=str(exc))
+
+    def verify_orders(self, expect: list[dict]) -> list[dict]:
+        """批次末统一回查委托表。expect: [{side,code,amount}]。
+
+        返回每项的核对结果 {side,code,amount,found,order}。
+        """
+        try:
+            self.ax.open_orders_tab()
+            orders = self.ax.read_orders()
+        except AXError as exc:
+            self.log.warning("委托表回查失败: %s", exc)
+            orders = []
+        out = []
+        for e in expect:
+            want = "买入" if e["side"] == "buy" else "卖出"
+            hit = next((o for o in orders
+                        if str(o.get("证券代码", "")).strip() == e["code"]
+                        and want in str(o.get("操作", ""))
+                        and str(o.get("委托数量", "")).strip() == str(e["amount"])),
+                       None)
+            out.append({**e, "found": hit is not None, "order": hit})
+        return out
 
     def buy(self, code: str, price: float, amount: int, submit: bool | None = None):
         return self.place("buy", code, price, amount, submit)

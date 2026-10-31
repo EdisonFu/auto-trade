@@ -21,6 +21,7 @@ class Config:
 
     # ---- 时序 ----
     settle: float = 0.3      # 轮询失败时的兜底等待
+    recognize_timeout: float = 3.0  # 等同花顺联动出名称/涨跌停的上限
     key_delay: float = 0.03  # 按键间隔;过小可能丢键,实测 0.03 稳定
     post_submit_wait: float = 1.5
 
