@@ -117,6 +117,9 @@ class Trader:
             return Result(Status.BLOCKED, side, code, price_str, amount_str, msg=err)
 
         try:
+            # 上一单可能留下警告框/确认框, 不清掉会让本单读到别人的确认框
+            # 而报"证券代码与预期不符"。
+            self.ax.dismiss_error_dialog()
             panel = self.switch(side)
 
             # 1) 代码 —— 必须先填,同花顺据此联动
@@ -204,6 +207,15 @@ class Trader:
                 self.log.error(msg)
                 return Result(Status.ERROR, side, code, price_str,
                               amount_str, self.ax.read_state(panel), msg)
+
+            # 券商拒单会弹只有[确认]的警告框(如"可用资金不足")。
+            # 必须关掉并如实报错, 否则它会一直挡住后续所有操作。
+            err_text = self.ax.dismiss_error_dialog()
+            if err_text:
+                msg = f"券商拒单: {redact(err_text)[:120]}"
+                self.log.error(msg)
+                return Result(Status.BLOCKED, side, code, price_str,
+                              amount_str, None, msg)
 
             self.log.info("二次确认框: %s", redact(dlg["text"].replace("\n", " "))[:120])
 

@@ -33,7 +33,7 @@ BUNDLE_ID = "cn.com.10jqka.macstockPro"
 _KEYCODE = {
     "0": 29, "1": 18, "2": 19, "3": 20, "4": 21,
     "5": 23, "6": 22, "7": 26, "8": 28, "9": 25,
-    ".": 47, "\b": 51, "\r": 36,
+    ".": 47, "\b": 51, "\r": 36, "esc": 53,
 }
 
 
@@ -422,6 +422,60 @@ class ThsAX:
     # ------------------------------------------------------------------
     # 二次确认框
     # ------------------------------------------------------------------
+    # 券商侧拒单时弹的是"警告"框: 只有[确认]一个按钮, 正文带错误码。
+    # 它必须被识别并关掉 —— 否则一直挂在屏幕上, 挡住后续所有操作。
+    ERROR_MARKS = ("可用资金不足", "可用股份不足", "超出涨跌幅", "警告",
+                   "不足", "失败", "错误", "拒绝", "非交易时间", "停牌")
+
+    def find_error_dialog(self) -> dict | None:
+        """查找券商拒单的警告框。返回 {'text','confirm'} 或 None。
+
+        不能复用 find_confirm_dialog —— 后者要求正文含"委托/证券代码"
+        才算数, 而警告框正文是错误码(如 [260200][可用资金不足]), 会被判空。
+        这里独立扫描: 只有[确认]没有[取消], 且正文命中错误关键词。
+        """
+        win = self.window()
+        texts, confirm, cancel = [], None, None
+
+        def walk(el, depth=0):
+            nonlocal confirm, cancel
+            if depth > 18:
+                return
+            role = str(attr(el, "AXRole") or "")
+            t = str(attr(el, "AXValue") or attr(el, "AXTitle") or "").strip()
+            if role == "AXButton" and t in ("确认", "确定"):
+                confirm = confirm or el
+            elif role == "AXButton" and t == "取消":
+                cancel = cancel or el
+            elif role == "AXStaticText" and t:
+                texts.append(t)
+            for c in attr(el, "AXChildren") or []:
+                walk(c, depth + 1)
+
+        walk(win)
+        if confirm is None or cancel is not None:
+            return None            # 有[取消]的是正常下单确认框
+        blob = " ".join(texts)
+        hit = [t for t in texts if any(m in t for m in self.ERROR_MARKS)]
+        if not hit:
+            return None
+        return {"text": " ".join(hit)[:200], "confirm": confirm}
+
+    def dismiss_error_dialog(self) -> str | None:
+        """关掉警告框并返回其正文, 没有则 None。"""
+        dlg = self.find_error_dialog()
+        if dlg is None:
+            return None
+        text = str(dlg.get("text", ""))
+        btn = dlg.get("confirm")
+        if btn is not None:
+            try:
+                self.press(btn)
+                time.sleep(0.4)
+            except AXError:
+                pass
+        return text
+
     def find_confirm_dialog(self) -> dict | None:
         """查找下单二次确认框。
 
@@ -649,6 +703,19 @@ class ThsAX:
     # ------------------------------------------------------------------
     # 左侧导航 (用户可能停在任意页面)
     # ------------------------------------------------------------------
+    def dismiss_overlay(self) -> None:
+        """点窗口空白处, 关掉搜索框下拉等遮挡 AX 遍历的浮层。"""
+        try:
+            x, y, w, h = geom(self.window())
+        except AXError:
+            return
+        cx, cy = x + w * 0.45, y + h * 0.75      # 下半部空白区
+        for ev in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
+            e = Quartz.CGEventCreateMouseEvent(
+                None, ev, (cx, cy), Quartz.kCGMouseButtonLeft)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, e)
+            time.sleep(0.05)
+
     def nav_buttons(self) -> list[tuple[int, float, object]]:
         """左侧导航栏按钮,返回 [(子节点索引, y坐标, 元素)]。
 
@@ -678,9 +745,15 @@ class ThsAX:
         except AXError:
             pass
 
-        for _ in range(max_tries):
+        for _try in range(max_tries):
             navs = self.nav_buttons()
             if not navs:
+                # 顶部搜索框的下拉面板会遮挡 AX 遍历, 导致读不到左侧导航。
+                # ESC 关不掉(它是独立浮层), 点窗口空白处才行。
+                if _try < max_tries - 1:
+                    self.dismiss_overlay()
+                    time.sleep(0.6)
+                    continue
                 raise AXError("未找到左侧导航栏按钮")
 
             # 优先试已知位置(第6项),再回退到全量探测
