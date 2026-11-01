@@ -24,6 +24,28 @@
 
 ---
 
+## 30 秒上手
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+# 授权一次：系统设置 → 隐私与安全性 → 辅助功能 → 勾选你的终端（见下文）
+.venv/bin/python tools/probe_ax.py          # 验证授权 + 同花顺可读
+```
+
+```python
+from auto_trade import Config, Runner
+
+runner = Runner(Config(dry_run=True))        # 先空跑，确认无误再改 False
+report = runner.run([
+    {"side": "buy",  "code": "600303", "price": 2.48, "amount": 100},
+    {"side": "sell", "code": "002284", "price_mode": "limit_down", "amount": 100},
+])
+print(report.summary())
+```
+
+空跑会把值填进同花顺但不提交，你能直接在界面上核对。确认无误后
+`Config(dry_run=False, auto_confirm=True)` 即为全自动。
+
 ## 为什么是这个方案
 
 调研过的三条路，实测后的结论：
@@ -227,6 +249,7 @@ runner.run(signals, on_result=on_result)
 | `blocked` | 风控/前置校验拦截，未提交 |
 | `unrecognized` | 同花顺未识别该标的，拒绝提交 |
 | `price_drift` | 价格被同花顺改写且不容忍，拒绝提交 |
+| `error` | 点击后未出现二次确认框等异常 —— **状态不明，必须人工核对** |
 
 `Result.ok` 为真仅包含 `filled_only` 与 `submitted`。批量执行后用 `report.needs_attention` 取出所有状态不确定的信号。
 
@@ -234,8 +257,17 @@ runner.run(signals, on_result=on_result)
 
 1. **窗口失焦后 AX 树塌缩为 0 节点** → 每次操作前 activate + 重试取窗口。
 
-2. **`AXValue` 直接写入是假阳性** —— 控件显示会变、读回"一致"，但同花顺业务层毫无反应（股票名/涨跌停/可买全是 `- -`）。据此提交会下出内部状态为空的单。
-   → **必须用 `CGEvent` 发真实键盘事件**。
+2. **`AXValue` 直接写入曾是假阳性** —— 早期实测：控件显示会变、读回"一致"，
+   但同花顺业务层毫无反应（股票名/涨跌停/可买全是 `- -`）。据此提交会下出
+   内部状态为空的单。
+   → 主路径用 `CGEvent` 发**真实键盘事件**。
+
+   但后来在连续下单压测中发现另一面：页面重建后键盘路径会**静默失败**
+   （退格清不掉旧值，新值也追加不进去），而此时 `AXValue` 直写反而能被
+   同花顺收到并正常触发联动。
+   → 现在是「键盘优先，写入未生效则回退 `AXValue`」，**两条路径都以
+   `read_state()` 的联动字段作为最终判据** —— 显示对了不算数，
+   同花顺查出名称和涨跌停才算数。
 
 3. **填代码会被同花顺自动改写价格为现价** → 价格放在最后填，提交前重读校验（`price_drift`）。
 
@@ -250,6 +282,44 @@ runner.run(signals, on_result=on_result)
    → 每单之前调 `reset_to_order_page(side)`：取消遗留确认框 → 确保在交易页 → 切方向 → 点[重填]清空（清不干净则逐框退格兜底，仍失败就报错拒绝执行）。
 
 8. **输入框靠标签 y 坐标配对，不能用子节点索引** —— 实测索引顺序是 `/41`(代码) `/37`(价格) `/42`(数量)，与视觉顺序不符。
+
+## 批量下单：延后回查
+
+每单下完都去委托表核对一次，要「开委托表 → 读表 → 切回下单页」，约
+0.9 秒/单。连续下 3 单就是 2.7 秒的纯开销。
+
+`verify=False` 跳过逐单回查，批次末统一核对：
+
+```python
+expect = []
+for sig in signals:
+    trader.place(sig["side"], sig["code"], sig["price"], sig["amount"],
+                 verify=False)
+    expect.append({"side": sig["side"], "code": sig["code"],
+                   "amount": sig["amount"]})
+
+for r in trader.verify_orders(expect):
+    print(r["code"], "命中" if r["found"] else "缺失", r["order"])
+```
+
+`verify_orders()` 按 **代码 + 方向 + 数量** 三项匹配，并轮询到全部命中或
+超时 5 秒 —— 委托表刷新有延迟（实测可达 2 秒），刚提交就读会误报缺失。
+
+> 只按代码匹配会撞上同一标的的历史委托而误报成功。这个 bug 真实发生过：
+> 买单返回 `submitted`，回查到的却是 20 分钟前的卖单。
+
+## 界面异常的自愈
+
+同花顺的界面状态会以几种方式干扰自动化，这些都已在代码中处理：
+
+| 现象 | 后果 | 处理 |
+|---|---|---|
+| 券商拒单弹「警告」框（只有[确认]，正文是错误码） | 框滞留在屏幕上，**挡住后续所有操作** | `dismiss_error_dialog()` 识别并关闭，返回 `blocked` + 券商原文 |
+| 顶部搜索框的下拉面板展开 | 遮挡 AX 遍历，读不到左侧导航（ESC 关不掉） | `dismiss_overlay()` 点窗口空白处 |
+| 切换买卖方向 / 从委托表返回 | 控件被重建，旧引用写入**静默失败**（值进不去也不报错） | `type_text` 检测到写入未生效时回退 `AXValue` 直写（见「踩过的坑」第 2 条的完整来龙去脉） |
+| 填完代码立刻读状态 | 联动是异步的（要回服务端查名称/涨跌停），必然读到空值 | 轮询等待，上限 `recognize_timeout`（默认 3 秒，实测 0.12 秒就绪） |
+
+这些不是假想场景 —— 每一条都是连续下单压测时暴露出来的。
 
 ## 风控
 
@@ -293,6 +363,31 @@ ax.goto_trade_page()           # 从任意页面进入交易页
 panel = ax.reset_to_order_page("sell")   # 归位到干净的卖出页
 ax.dismiss_dialogs()           # 单独清理遗留确认框
 ```
+
+## 配置项
+
+```python
+Config(
+    dry_run=True,              # True=只填值不提交(安全默认)
+    auto_confirm=False,        # 是否自动点二次确认框
+    strict_params=True,        # 确认框内容须与入参逐一相符, 否则放弃本单
+    require_recognized=True,   # 必须确认同花顺已识别标的
+    check_price_limit=True,    # 校验价格在涨跌停区间内
+    allow_price_override=False,# 同花顺改写价格时是否容忍
+
+    max_orders_per_day=50,
+    max_amount_per_order=50000.0,
+    max_turnover_per_day=200000.0,
+    stock_whitelist=[],        # 非空时只允许这些代码
+
+    recognize_timeout=3.0,     # 等同花顺联动出名称/涨跌停的上限
+    key_delay=0.03,            # 按键间隔, 过小会丢键
+    post_submit_wait=1.5,
+)
+```
+
+> `max_amount_per_order` 默认 5 万是**示例值，不是推荐值**。首次使用请按
+> 自己的实际规模调小。
 
 ## 目录
 
