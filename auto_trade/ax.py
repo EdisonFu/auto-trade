@@ -541,6 +541,59 @@ class ThsAX:
         return text
 
     # ------------------------------------------------------------------
+    # 资金
+    # ------------------------------------------------------------------
+    def read_funds(self) -> dict[str, float]:
+        """读左侧资金区。返回 {可用金额, 总资产, 总市值, 资金余额, ...}。
+
+        键为界面原文, 值为 float。读不到的键不会出现 —— 调用方必须自己
+        判断 "可用金额" 在不在结果里, 不要默认它存在。
+
+        这是券商的权威口径: 可用金额已扣掉在途委托冻结的钱, 比配置里
+        写死的 CAP 准确, 且随成交实时变化, 故须在下单前现读。
+        """
+        win = self.window()
+        items: list[tuple[float, float, str]] = []
+
+        def walk(el, depth=0):
+            if depth > 14:
+                return
+            if str(attr(el, "AXRole") or "") == "AXStaticText":
+                text = str(attr(el, "AXValue") or attr(el, "AXTitle") or "").strip()
+                if text:
+                    x, y, _w, _h = geom(el)
+                    # 左侧资金区: x<260 排除中部下单面板, y 圈定资金块
+                    if x < 260 and 100 <= y <= 300:
+                        items.append((y, x, text))
+            for c in attr(el, "AXChildren") or []:
+                walk(c, depth + 1)
+
+        walk(win)
+        items.sort()
+
+        # 版面是"标签 | 数值"两列: 同一行(y 差 <6)取标签右侧的数字
+        out: dict[str, float] = {}
+        for y, x, text in items:
+            if not text.endswith(("额", "产", "值", "亏")):
+                continue
+            for yy, xx, val in items:
+                if abs(yy - y) < 6 and xx > x:
+                    try:
+                        out[text] = float(val.replace(",", ""))
+                    except ValueError:
+                        pass
+                    break
+        return out
+
+    def available_cash(self) -> float | None:
+        """可用金额(可立即用于买入的现金)。读不到返回 None。
+
+        返回 None 时调用方应中止下单, 而不是退回某个默认值 —— 拿不准
+        账户有多少钱就不该下单。
+        """
+        return self.read_funds().get("可用金额")
+
+    # ------------------------------------------------------------------
     # 委托查询
     # ------------------------------------------------------------------
     def open_orders_tab(self) -> None:
