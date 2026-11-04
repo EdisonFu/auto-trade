@@ -597,7 +597,7 @@ class ThsAX:
     # 委托查询
     # ------------------------------------------------------------------
     def open_orders_tab(self) -> None:
-        """点击下方[委托]页签。"""
+        """点击下方[委托]页签, 并确保「只显示可撤委托」未勾选。"""
         win = self.window()
         for el in attr(win, "AXChildren") or []:
             if str(attr(el, "AXRole") or "") != "AXButton":
@@ -611,8 +611,45 @@ class ThsAX:
                     "委托" in str(attr(c, "AXTitle") or "")
                     for c in (attr(self.window(), "AXChildren") or [])
                 ), timeout=2.5, interval=0.05, settle=0.2)
+                self.show_all_orders()
                 return
         raise AXError("未找到[委托]页签")
+
+    def show_all_orders(self) -> bool:
+        """取消「只显示可撤委托」, 否则废单/已成交根本不在表里。
+
+        2026-11-04 实测: 该复选框勾选时 read_orders() 返回 0 笔, 而当天
+        实际有 5 笔(3 已成 + 2 废单)。它会同时毁掉两件事 ——
+          * 下单后核对: 报成功的单被判成 "委托表中无此笔, 可能未成功报单"
+          * 废单重挂:   看不到废单, 以为没有, 该补的不补
+        返回 True 表示本次动过它(原来是勾选状态)。
+        """
+        win = self.window()
+        box = None
+
+        def walk(el, depth=0):
+            nonlocal box
+            if box is not None or depth > 18:
+                return
+            if str(attr(el, "AXRole") or "") == "AXCheckBox":
+                x, y, _w, _h = geom(el)
+                # 复选框本身无标题, 靠紧邻右侧的「只显示可撤委托」文本定位
+                if 395 <= y <= 420 and 760 <= x <= 860:
+                    box = el
+                    return
+            for c in attr(el, "AXChildren") or []:
+                walk(c, depth + 1)
+
+        walk(win)
+        if box is None:
+            return False                      # 版面变了, 交给调用方从行数判断
+        if str(attr(box, "AXValue") or "0").strip() not in ("1", "true", "True"):
+            return False                      # 本来就没勾
+        self.press(box)
+        wait_until(lambda: str(attr(box, "AXValue") or "0").strip()
+                   not in ("1", "true", "True"),
+                   timeout=2.0, interval=0.05, settle=0.2)
+        return True
 
     def read_orders(self) -> list[dict]:
         """读当日委托表。空列表表示没有任何委托记录。"""
