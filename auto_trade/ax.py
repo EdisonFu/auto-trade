@@ -205,6 +205,8 @@ class ThsAX:
           - 冷启动到登录框可操作约需 10~20s, 故默认等 40s。
         返回是否已就绪(进程在且主窗口 AX 树非空)。
         """
+        # 锁屏下窗口不上屏, 下面的就绪判断必然超时; 所有入口都经过这里, 先点亮
+        self.wake_screen()
         if not app_running():
             subprocess.run(["open", "-b", BUNDLE_ID], capture_output=True)
             if not wait_until(app_running, timeout=timeout, interval=0.3):
@@ -983,6 +985,26 @@ class ThsAX:
                 return el
         return None
 
+    @staticmethod
+    def screen_locked() -> bool:
+        d = Quartz.CGSessionCopyCurrentDictionary() or {}
+        return bool(d.get("CGSSessionScreenIsLocked"))
+
+    @classmethod
+    def wake_screen(cls, timeout: float = 8.0) -> bool:
+        """点亮屏幕并等锁屏解除。返回是否已解锁。
+
+        熄屏(手动或 pmset displaysleepnow)会进入锁屏, 锁屏下 AX 树塌缩,
+        所有操作必败 —— 2026-11-06 凌晨演练即因此 3 笔全失败。在未设锁屏
+        密码的前提下, caffeinate -u 会点亮并自动解锁。这里放在自检/下单
+        的最前面, 不依赖 09:18 的点亮任务一定跑过。
+        """
+        if not cls.screen_locked():
+            return True
+        subprocess.run(["caffeinate", "-u", "-t", "3"], capture_output=True)
+        return bool(wait_until(lambda: not cls.screen_locked() or None,
+                               timeout=timeout, interval=0.3, settle=1.0))
+
     def ready_to_trade(self, password: str | None = None) -> tuple[bool, str]:
         """下单前就绪自检: 逐项验证真正要用到的能力, 而非只看"能取到窗口"。
 
@@ -1000,6 +1022,8 @@ class ThsAX:
         from ApplicationServices import AXIsProcessTrusted
         if not AXIsProcessTrusted():
             return False, "辅助功能未授权"
+        if not self.wake_screen():
+            return False, "屏幕处于锁屏且无法自动解锁(是否重新设了锁屏密码?)"
 
         if not app_running():
             if not self.launch_app():

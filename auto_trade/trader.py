@@ -112,6 +112,8 @@ class Trader:
         """
         if not self.cfg.self_heal:
             return True, "self_heal 关闭"
+        # 锁屏下快路径会读到空树然后误入完整自检, 先点亮
+        self.ax.wake_screen()
         # 已就绪的快路径: 不把每单都拖慢到完整自检(约 2s)
         try:
             if (self.ax.login_sheet() is None and self.ax.nav_buttons()
