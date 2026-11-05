@@ -19,6 +19,14 @@ class Config:
     max_turnover_per_day: float = 200000.0
     stock_whitelist: list[str] = field(default_factory=list)
 
+    # ---- 自愈 ----
+    # 交易密码: 由调用方传入, 本模块不读钥匙串/环境变量、不落盘。
+    # 给了它, 下单前发现未登录(冷启动、会话被踢)就会自动登录;
+    # 不给则只报"未登录"并拒绝下单。repr=False 防止被日志打印出来。
+    trade_password: str = field(default="", repr=False)
+    self_heal: bool = True   # 每单前自检, 窗口被关/App 退出/掉登录时自动恢复
+    max_attempts: int = 3    # 单笔最多尝试次数: 1 原地 → 2 自检恢复 → 3+ 重启同花顺
+
     # ---- 时序 ----
     settle: float = 0.3      # 轮询失败时的兜底等待
     recognize_timeout: float = 3.0  # 等同花顺联动出名称/涨跌停的上限

@@ -37,6 +37,8 @@ class Result:
     amount: str
     state: PanelState | None = None
     msg: str = ""
+    # 已点过[确定买入/卖出]: 这之后出的任何异常, 单都可能已经报出去了
+    maybe_sent: bool = False
 
     @property
     def ok(self) -> bool:
@@ -102,19 +104,137 @@ class Trader:
         """
         return self.ax.reset_to_order_page(side)
 
+    def ensure_ready(self) -> tuple[bool, str]:
+        """确保同花顺可下单: 没开就拉起、窗口被关就唤回、掉登录就重登。
+
+        Trader 自己负责, 不指望调用方先跑好自检 —— 9:25 下单那一刻的状态
+        才算数, 9:18 的检查通过不代表 9:25 还行(2026-11-05 实盘即如此)。
+        """
+        if not self.cfg.self_heal:
+            return True, "self_heal 关闭"
+        # 已就绪的快路径: 不把每单都拖慢到完整自检(约 2s)
+        try:
+            if (self.ax.login_sheet() is None and self.ax.nav_buttons()
+                    and "可用金额" in self.ax.read_funds()):
+                return True, "已就绪"
+        except AXError:
+            pass
+        ok, why = self.ax.ready_to_trade(self.cfg.trade_password or None)
+        (self.log.info if ok else self.log.error)("就绪自检: %s", why)
+        return ok, why
+
+    # 换环境重试也解决不了的结果: 风控拦截/券商拒单/价格被改写/等人工确认。
+    # 其余(AX 异常、未识别、点了确认却查不到)都可能是界面状态问题, 值得重来。
+    _FINAL = {Status.FILLED_ONLY, Status.SUBMITTED, Status.BLOCKED,
+              Status.PRICE_DRIFT, Status.AWAITING_CONFIRM}
+
+    def _count_orders(self, side: str, code: str, amount: int) -> int | None:
+        """委托表里 同代码+同方向+同数量 的条数; 读不到返回 None。
+
+        用"下单前后条数是否增加"判断这单报没报出去, 不怕撞上当天同一只票
+        的历史委托(含废单)。
+        """
+        want = "买入" if side == "buy" else "卖出"
+        try:
+            self.ax.open_orders_tab()
+            orders = self.ax.read_orders()
+        except AXError as exc:
+            self.log.warning("读委托表失败: %s", exc)
+            return None
+        return sum(1 for o in orders
+                   if str(o.get("证券代码", "")).strip() == code
+                   and want in str(o.get("操作", ""))
+                   and str(o.get("委托数量", "")).strip() == str(amount))
+
+    def restart_app(self) -> tuple[bool, str]:
+        """退出同花顺 → 冷启动 → 登录 → 自检。最重的一级恢复。"""
+        self.log.warning("重启同花顺...")
+        if not self.ax.quit_app():
+            return False, "同花顺退出失败"
+        return self.ax.ready_to_trade(self.cfg.trade_password or None)
+
     def place(
         self, side: str, code: str, price: float, amount: int,
         submit: bool | None = None, verify: bool = True,
     ) -> Result:
-        """下单。submit=None 时取 cfg.dry_run 的反值。"""
+        """下单, 失败则逐级恢复后重来, 直到委托表里出现这一单。
+
+        恢复分级(第 n 次尝试前):
+          1. 快速就绪检查(已就绪约 0.3s, 不就绪才走完整自检)
+          2. 完整自检: 拉起/唤回窗口/重登
+          3+. 退出同花顺重启 —— 界面卡死、弹出不认识的框时只有这招管用
+
+        防重复下单: 真实提交时, 第一次尝试前记下委托表里同代码同方向同数量
+        的条数作为基线; 之后每次重试前先复查, 条数已增加说明上一次其实报
+        出去了(只是没确认到), 直接返回成功而不再下单。
+        """
         do_submit = (not self.cfg.dry_run) if submit is None else submit
         price_str = f"{price:.2f}"
         amount_str = str(amount)
-
         err = self._risk(code, price, amount)
         if err:
             self.log.warning("风控拦截 %s %s: %s", side, code, err)
             return Result(Status.BLOCKED, side, code, price_str, amount_str, msg=err)
+
+        attempts = max(1, self.cfg.max_attempts if self.cfg.self_heal else 1)
+        baseline: int | None = None
+        res: Result | None = None
+        for n in range(1, attempts + 1):
+            if n == 1:
+                ok, why = self.ensure_ready()
+            elif n == 2:
+                ok, why = self.ax.ready_to_trade(self.cfg.trade_password or None)
+            else:
+                ok, why = self.restart_app()
+            if not ok:
+                self.log.error("第%d次: 同花顺未就绪: %s", n, why)
+                res = Result(Status.ERROR, side, code, price_str, amount_str,
+                             msg=f"同花顺未就绪: {why}")
+                continue
+
+            if do_submit:
+                cnt = self._count_orders(side, code, amount)
+                if baseline is None:
+                    baseline = cnt
+                elif cnt is not None and cnt > baseline:
+                    self.log.warning("第%d次前复查: 委托表已有 %s 这一单"
+                                     "(上次其实已报出), 不再重复下单", n, code)
+                    return Result(Status.SUBMITTED, side, code, price_str,
+                                  amount_str, None,
+                                  f"重试前复查到委托(第{n-1}次已报出)")
+
+            res = self._place_once(side, code, price, amount, submit, verify)
+            if res.status in self._FINAL:
+                if n > 1:
+                    res.msg = f"[第{n}次尝试] {res.msg}"
+                return res
+            self.log.warning("第%d/%d次未完成 (%s): %s",
+                             n, attempts, res.status.value, res.msg)
+            # 单可能已报出, 却又没有可信的委托表基线去核对 —— 此时重下有
+            # 重复成交的风险, 宁可停下交给人工(告警邮件会带上这条)。
+            if do_submit and res.maybe_sent and baseline is None:
+                res.msg = ("[已停止重试: 单可能已报出但委托表读不到, 无法排除"
+                           f"重复下单, 请人工核对] {res.msg}")
+                return res
+
+        # 所有尝试用尽: 最后再查一次, 免得把"其实报出去了"误报为失败
+        if do_submit and baseline is not None:
+            cnt = self._count_orders(side, code, amount)
+            if cnt is not None and cnt > baseline:
+                return Result(Status.SUBMITTED, side, code, price_str,
+                              amount_str, None, "末次复查到委托")
+        assert res is not None
+        res.msg = f"[{attempts}次尝试均未完成] {res.msg}"
+        return res
+
+    def _place_once(
+        self, side: str, code: str, price: float, amount: int,
+        submit: bool | None, verify: bool,
+    ) -> Result:
+        do_submit = (not self.cfg.dry_run) if submit is None else submit
+        price_str = f"{price:.2f}"
+        amount_str = str(amount)
+        maybe_sent = False
 
         try:
             # 上一单可能留下警告框/确认框, 不清掉会让本单读到别人的确认框
@@ -197,6 +317,7 @@ class Trader:
             # 4) 点[确定买入/卖出] —— 这一步只会弹出二次确认框,并未报单
             import time
             self.log.info("点击[%s]", panel.submit_title)
+            maybe_sent = True
             self.ax.press(panel.submit)
             # 轮询确认框出现,不盲等 —— 通常 200~400ms 就弹出来了
             dlg = wait_until(self.ax.find_confirm_dialog,
@@ -206,7 +327,8 @@ class Trader:
                 msg = "点击后未出现二次确认框,状态不明,请人工核对"
                 self.log.error(msg)
                 return Result(Status.ERROR, side, code, price_str,
-                              amount_str, self.ax.read_state(panel), msg)
+                              amount_str, self.ax.read_state(panel), msg,
+                              maybe_sent=True)
 
             # 券商拒单会弹只有[确认]的警告框(如"可用资金不足")。
             # 必须关掉并如实报错, 否则它会一直挡住后续所有操作。
@@ -280,7 +402,7 @@ class Trader:
                               amount_str, None,
                               f"已确认并回查到委托: {matched[0]}")
             return Result(Status.NO_RECORD, side, code, price_str, amount_str,
-                          None,
+                          None, maybe_sent=True, msg=
                           f"已点确认但委托表无 {code} 记录"
                           f"(当前共 {len(orders)} 条);非交易时段属正常,"
                           "交易时段出现此状态须立即人工核对")
@@ -288,7 +410,7 @@ class Trader:
         except AXError as exc:
             self.log.error("AX 异常: %s", exc)
             return Result(Status.ERROR, side, code, price_str, amount_str,
-                          msg=str(exc))
+                          msg=str(exc), maybe_sent=maybe_sent)
 
     @staticmethod
     def _match_order(orders: list[dict], e: dict):

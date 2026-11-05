@@ -25,9 +25,29 @@ from ApplicationServices import (
     kAXValueCGPointType,
     kAXValueCGSizeType,
 )
-from Cocoa import NSWorkspace
+from Cocoa import NSRunningApplication
 
 BUNDLE_ID = "cn.com.10jqka.macstockPro"
+APP_PATH = "/Applications/同花顺.app"
+
+
+def running_apps():
+    """同花顺的 NSRunningApplication 列表(实时)。
+
+    2026-11-05 的教训: 不要用 NSWorkspace.sharedWorkspace().runningApplications()。
+    在不跑 runloop 的脚本进程里它是一份**永不刷新的快照** —— 实测同花顺退出
+    7 秒后它仍报"在运行", 启动 10 秒后仍报"没运行"。ths_login 的冷启动因此
+    空等 25 秒后报"启动超时", 而同花顺其实早已起来。
+    NSRunningApplication.runningApplicationsWithBundleIdentifier_ 每次都现查。
+    """
+    return list(
+        NSRunningApplication.runningApplicationsWithBundleIdentifier_(BUNDLE_ID)
+        or []
+    )
+
+
+def app_running() -> bool:
+    return bool(running_apps())
 
 # CGEvent 虚拟键码
 _KEYCODE = {
@@ -150,6 +170,68 @@ class ThsAX:
     # ------------------------------------------------------------------
     # 进程 / 窗口
     # ------------------------------------------------------------------
+    def quit_app(self, timeout: float = 15.0) -> bool:
+        """退出同花顺。主要给测试/演练造冷启动态用。
+
+        osascript quit 会被挂起的确认框挡住并报 -128(用户已取消), 所以逐级
+        加力: quit → terminate → kill -9。注意进程名是"同花顺"而非 bundle id,
+        pkill -f 10jqka 匹配不到。
+        """
+        subprocess.run(
+            ["osascript", "-e", f'tell application id "{BUNDLE_ID}" to quit'],
+            capture_output=True)
+        if wait_until(lambda: not app_running() or None, timeout=5.0,
+                      interval=0.3):
+            return True
+        for app in running_apps():
+            app.terminate()
+        if wait_until(lambda: not app_running() or None, timeout=5.0,
+                      interval=0.3):
+            return True
+        for app in running_apps():
+            app.forceTerminate()
+        return bool(wait_until(lambda: not app_running() or None,
+                               timeout=timeout, interval=0.3))
+
+    def launch_app(self, timeout: float = 40.0) -> bool:
+        """同花顺没在跑就拉起来, 等到 AX 主窗口真的有内容。
+
+        冷启动(App 完全退出)与"窗口被关掉"是两回事, 后者进程还活着, 由
+        _reopen_main_window 处理。这里只负责"进程都没有"的情况。
+
+        实测要点(2026-11-05, 同花顺 5.3.5):
+          - open -b 之后进程立刻出现, 但 AXWindows 仍为 0, 必须 activate
+            一次窗口才会真正上屏;
+          - 冷启动到登录框可操作约需 10~20s, 故默认等 40s。
+        返回是否已就绪(进程在且主窗口 AX 树非空)。
+        """
+        if not app_running():
+            subprocess.run(["open", "-b", BUNDLE_ID], capture_output=True)
+            if not wait_until(app_running, timeout=timeout, interval=0.3):
+                return False
+
+        def tree_ready():
+            """必须是**真窗口**: AXWindows 非空且有子节点, 且已上屏。
+
+            不能拿 AXMainWindow 兜底 —— 刚 open 出来的进程 AXWindows 为 0
+            但 AXMainWindow 已能读出 83 个子节点, 据此判定"就绪"会跳过
+            activate, 窗口始终不上屏, 后续一切点击都落空。
+            """
+            if self._onscreen_windows() <= 0:
+                return False
+            try:
+                app = AXUIElementCreateApplication(self._pid())
+            except AXError:
+                return False
+            return self._main_of(app) is not None
+
+        if tree_ready():
+            return True
+        # 刚 open 出来的进程 AXWindows 为 0, activate 一下窗口才上屏
+        self.activate(timeout=6.0)
+        return bool(wait_until(tree_ready, timeout=timeout, interval=0.3,
+                               settle=0.5))
+
     def activate(self, timeout: float = 3.0) -> None:
         """激活同花顺并等它真正到前台(轮询,不盲等)。"""
         subprocess.run(
@@ -158,18 +240,15 @@ class ThsAX:
         )
 
         def is_front():
-            for app in NSWorkspace.sharedWorkspace().runningApplications():
-                if app.bundleIdentifier() == BUNDLE_ID:
-                    return app.isActive()
-            return False
+            return any(app.isActive() for app in running_apps())
 
         wait_until(is_front, timeout=timeout, interval=0.03, settle=0.08)
 
     def _pid(self) -> int:
-        for app in NSWorkspace.sharedWorkspace().runningApplications():
-            if app.bundleIdentifier() == BUNDLE_ID:
-                return app.processIdentifier()
-        raise AXError("同花顺未运行")
+        apps = running_apps()
+        if not apps:
+            raise AXError("同花顺未运行")
+        return apps[0].processIdentifier()
 
     @staticmethod
     def _onscreen_windows() -> int:
@@ -230,13 +309,32 @@ class ThsAX:
         )
         wait_until(opened, timeout=4.0, interval=0.1, settle=0.3)
 
+    @staticmethod
+    def _main_of(app):
+        """取真正的主窗口, 不取 AXWindows[0]。
+
+        2026-11-05 实测: 交易密码框获得焦点时, macOS「密码」自动填充会在
+        同花顺进程内弹出一个小浮窗(只含一格「密码…」), 它排在 AXWindows[0]。
+        原实现取 [0] 就把浮窗当成主窗口 —— 登录框"凭空消失", 后续点击落在
+        「密码…」上, 弹出「"密码"已锁定」的 Touch ID 解锁框, 自动登录全线失败。
+        只认 AXStandardWindow, 并取子节点最多的那个。
+        """
+        wins = [w for w in (attr(app, "AXWindows") or [])
+                if str(attr(w, "AXSubrole") or "") == "AXStandardWindow"
+                and (attr(w, "AXChildren") or [])]
+        if not wins:
+            return None
+        return max(wins, key=lambda w: len(attr(w, "AXChildren") or []))
+
     def window(self, timeout: float = 5.0):
         """取主窗口。失焦时 AX 树会塌缩,故轮询而非盲等。"""
+        if not app_running():
+            # 冷启动: 进程都没有, 先拉起来(launchd 重启、手动退出都会到这)
+            self.launch_app()
         app = AXUIElementCreateApplication(self._pid())
 
         def ready():
-            wins = attr(app, "AXWindows") or []
-            return wins[0] if wins and (attr(wins[0], "AXChildren") or []) else None
+            return self._main_of(app)
 
         win = ready()
         if win is not None:
@@ -505,6 +603,98 @@ class ThsAX:
                 pass
         return text
 
+    def _click_at(self, x: float, y: float) -> None:
+        for ev in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap,
+                               Quartz.CGEventCreateMouseEvent(
+                                   None, ev, (x, y), Quartz.kCGMouseButtonLeft))
+            time.sleep(0.08)
+
+    def find_password_unlock(self) -> tuple[float, float, float, float] | None:
+        """「"密码"已锁定」解锁框的位置, 没有返回 None。
+
+        它由 macOS 自动填充弹在同花顺**进程内**, 但不进 AX 树(AXWindows 看不到,
+        按钮也遍历不到), 只能靠窗口服务器的窗口尺寸(约 440x515)识别。
+        """
+        try:
+            pid = self._pid()
+        except AXError:
+            return None
+        wins = Quartz.CGWindowListCopyWindowInfo(
+            Quartz.kCGWindowListOptionOnScreenOnly
+            | Quartz.kCGWindowListExcludeDesktopElements,
+            Quartz.kCGNullWindowID,
+        ) or []
+        for w in wins:
+            if w.get("kCGWindowOwnerPID") != pid:
+                continue
+            b = w.get("kCGWindowBounds") or {}
+            if 400 <= b.get("Width", 0) <= 480 and 480 <= b.get("Height", 0) <= 550:
+                return b["X"], b["Y"], b["Width"], b["Height"]
+        return None
+
+    def dismiss_password_unlock(self) -> bool:
+        """误弹「"密码"已锁定」时点[取消]。无人值守时没人按 Touch ID, 不取消
+        它会一直挡在登录框上。返回是否取消过。"""
+        box = self.find_password_unlock()
+        if box is None:
+            return False
+        self.activate(timeout=3.0)
+        x, y, w, h = box
+        # 不在 AX 树里, 只能按坐标点。[取消]在框内右下, 实测偏移 (315, 483)
+        self._click_at(x + w * 315 / 440, y + h * 483 / 515)
+        wait_until(lambda: self.find_password_unlock() is None,
+                   timeout=3.0, interval=0.1, settle=0.3)
+        return self.find_password_unlock() is None
+
+    @staticmethod
+    def dismiss_system_prompt() -> str | None:
+        """取消系统弹出的凭据对话框(钥匙串解锁 / Touch ID / 授权)。
+
+        这类框由 SecurityAgent / CoreAuthUI 弹出, **不属于同花顺的 AX 树**,
+        所以 dismiss_dialogs 看不见它, 却会抢走焦点让后续键盘事件全部落空。
+        无人值守时它永远等不到人按 Touch ID, 必须主动点[取消]继续。
+
+        正常路径下不该出现 —— 取密码已不走钥匙串。这里是兜底。
+        返回被取消的对话框所属进程名, 没有则 None。
+        """
+        # 先用 pgrep 判断有没有这类进程: 直接跑 osascript 遍历要 6s+
+        if not any(subprocess.run(["pgrep", "-x", name],
+                                  capture_output=True).returncode == 0
+                   for name in ("SecurityAgent", "CoreAuthUI")):
+            return None
+        script = '''
+        tell application "System Events"
+          repeat with procName in {"SecurityAgent", "CoreAuthUI"}
+            try
+              if exists (process procName) then
+                tell process procName
+                  repeat with w in windows
+                    try
+                      if exists (button "取消" of w) then
+                        click button "取消" of w
+                        return procName as text
+                      else if exists (button "Cancel" of w) then
+                        click button "Cancel" of w
+                        return procName as text
+                      end if
+                    end try
+                  end repeat
+                end tell
+              end if
+            end try
+          end repeat
+        end tell
+        return ""
+        '''
+        out = subprocess.run(["osascript", "-e", script],
+                             capture_output=True, text=True)
+        name = (out.stdout or "").strip()
+        if name:
+            time.sleep(0.5)
+            return name
+        return None
+
     def find_confirm_dialog(self) -> dict | None:
         """查找下单二次确认框。
 
@@ -614,7 +804,186 @@ class ThsAX:
                     break
         return out
 
-    def ready_to_trade(self) -> tuple[bool, str]:
+    # ------------------------------------------------------------------
+    # 登录
+    # ------------------------------------------------------------------
+    def login_sheet(self):
+        """交易登录框(AXSheet)。不在登录界面返回 None。
+
+        按 **role + placeholder** 定位, 不写死子节点索引。实测该 sheet 恰好
+        排在主窗口子节点末位(/83), 但那只是"最后添加的节点排最后"的巧合 ——
+        主窗口子节点数会随行情页面变化(实测 83/84 都出现过), 写死必然漂移。
+        """
+        try:
+            win = self.window()
+        except AXError:
+            return None
+        for el in attr(win, "AXChildren") or []:
+            if str(attr(el, "AXRole") or "") != "AXSheet":
+                continue
+            sub = attr(el, "AXChildren") or []
+            has_pw = any(
+                str(attr(c, "AXPlaceholderValue") or "") == "请输入交易密码"
+                for c in sub)
+            has_btn = any(
+                str(attr(c, "AXTitle") or "").strip() == "登录" for c in sub)
+            if has_pw and has_btn:
+                return el
+        return None
+
+    @staticmethod
+    def _sheet_field(sheet, placeholder: str):
+        for c in attr(sheet, "AXChildren") or []:
+            if str(attr(c, "AXPlaceholderValue") or "") == placeholder:
+                return c
+        return None
+
+    @staticmethod
+    def _sheet_button(sheet, title: str):
+        for c in attr(sheet, "AXChildren") or []:
+            if str(attr(c, "AXTitle") or "").strip() == title:
+                return c
+        return None
+
+    def read_captcha(self, sheet) -> str:
+        """读验证码。
+
+        同花顺把 5 位验证码以 AXStaticText **明文**暴露, 无需 OCR。它们紧挨
+        验证码输入框右侧, 故取"在输入框右边、y 与之同排"的 StaticText, 按 x
+        排序拼接 —— 不按索引取, sheet 里还有别的 StaticText(标签文字)。
+        """
+        box = self._sheet_field(sheet, "请输入验证码")
+        if box is None:
+            return ""
+        bx, by, bw, _bh = geom(box)
+        digits = []
+        for c in attr(sheet, "AXChildren") or []:
+            if str(attr(c, "AXRole") or "") != "AXStaticText":
+                continue
+            x, y, _w, _h = geom(c)
+            if x < bx + bw or abs(y - by) > 8:
+                continue
+            v = str(attr(c, "AXValue") or "").strip()
+            if v.isdigit():
+                digits.append((x, v))
+        return "".join(v for _x, v in sorted(digits))
+
+    def logged_in(self, probe_code: str = "600303",
+                  timeout: float = 4.0) -> bool:
+        """是否已登录交易。
+
+        判据分两级, 先快后慢:
+          1. 资金区读到「可用金额」—— 未登录时资金区恒为空, 这一条又快
+             (约 0.2s) 又不触碰界面;
+          2. 资金区读不到时, 再用下单面板的业务联动兜底(填代码看股票名/
+             涨跌停是否联动)。未登录则恒为 '- -'。
+
+        不能只用第 2 条: 它会调 reset_to_order_page 点击界面, 刚登录成功
+        那几秒界面还在切换, 联动探测会超时而误判"未登录" —— 实测冷启动
+        登录其实已成功, 却被判失败并报"登录框消失但未登录"。
+        """
+        if self.login_sheet() is not None:
+            return False
+        try:
+            if "可用金额" in self.read_funds():
+                return True
+        except AXError:
+            pass
+        try:
+            p = self.reset_to_order_page("buy")
+            self.type_text(p.code, probe_code)
+            return bool(wait_until(
+                lambda: self.read_state(p).recognized or None, timeout=timeout))
+        except AXError:
+            return False
+
+    def login(self, password: str, *, retries: int = 3) -> tuple[bool, str]:
+        """填密码+验证码并登录。密码由调用方传入, 本模块不碰钥匙串。
+
+        返回 (是否已登录, 说明)。已登录则直接返回 True。
+        验证码偶尔读不全(渲染未完成), 故重试。
+        """
+        if not self.launch_app():
+            return False, "同花顺拉起失败"
+        if not password:
+            return False, "未提供交易密码"
+        self.activate(timeout=6.0)
+
+        sheet = self.login_sheet()
+        if sheet is None:
+            if self.logged_in():
+                return True, "已登录"
+            # 冷启动时登录框是**自动弹出**的, 只是渲染比窗口慢几秒。先等它
+            # 自己出来, 别急着点[立即登录] —— 那会在框已弹出时再点一次,
+            # 把框关掉或叠出第二个, 实测因此失败("登录框消失但未登录")。
+            sheet = wait_until(self.login_sheet, timeout=12.0, interval=0.3,
+                               settle=0.3)
+        if sheet is None:
+            # 等不来才主动点入口
+            btn = self._find_button("立即登录")
+            if btn is None:
+                return False, "既未登录, 也找不到登录入口"
+            self.press(btn)
+            sheet = wait_until(self.login_sheet, timeout=10.0, interval=0.3,
+                               settle=0.3)
+            if sheet is None:
+                return False, "点[立即登录]后登录框未出现"
+
+        last_err = ""
+        for n in range(1, retries + 1):
+            # 每轮都先激活: 窗口离屏/失焦时 press 会落空而填字仍"看着成功",
+            # 于是出现"密码填进去了但登录没点动"的假象(实测 onscreen=0 时
+            # 必然如此)。另外顺手取消误弹的系统凭据框, 它会抢焦点。
+            self.dismiss_system_prompt()
+            self.activate(timeout=6.0)
+            self.dismiss_password_unlock()
+            sheet = self.login_sheet()
+            if sheet is None:
+                return (True, "登录成功") if self.logged_in() else \
+                       (False, "登录框消失但未登录")
+            cap = self.read_captcha(sheet)
+            if len(cap) < 4:
+                time.sleep(1.5)
+                continue
+            pw_box = self._sheet_field(sheet, "请输入交易密码")
+            cap_box = self._sheet_field(sheet, "请输入验证码")
+            btn = self._sheet_button(sheet, "登录")
+            if not (pw_box and cap_box and btn):
+                return False, "登录框控件不全"
+            self.type_text(pw_box, password)
+            time.sleep(0.2)
+            self.type_text(cap_box, cap)
+            time.sleep(0.2)
+            self.press(btn)
+            # 登录完成的信号是**资金区可读**, 不是登录框消失: 实测按下后
+            # 0.1s 框就没了, 但资金要再过 1~数秒才加载(冷启动更慢)。若此时
+            # 就判定, 资金为空会退到联动探测, 界面切换中探测超时 → 误判失败。
+            def done():
+                if self.login_sheet() is not None:
+                    return None
+                return "可用金额" in self.read_funds() or None
+            if wait_until(done, timeout=20.0, interval=0.5):
+                return True, f"登录成功(第{n}次)"
+            if self.login_sheet() is None and self.logged_in():
+                return True, f"登录成功(第{n}次, 联动确认)"
+            err = self.dismiss_error_dialog()
+            if err:
+                last_err = err
+            time.sleep(1.5)
+        return False, f"登录 {retries} 次均失败" + (
+            f"(同花顺提示: {last_err[:60]})" if last_err else "")
+
+    def _find_button(self, title: str):
+        try:
+            win = self.window()
+        except AXError:
+            return None
+        for el in attr(win, "AXChildren") or []:
+            if str(attr(el, "AXTitle") or "").strip() == title:
+                return el
+        return None
+
+    def ready_to_trade(self, password: str | None = None) -> tuple[bool, str]:
         """下单前就绪自检: 逐项验证真正要用到的能力, 而非只看"能取到窗口"。
 
         2026-11-05 的教训: screen.sh 在 09:18 只检查 window() 能否返回,
@@ -623,10 +992,18 @@ class ThsAX:
         到资金区、点得到导航、翻得开委托表 —— 必须逐项真测。
 
         返回 (是否就绪, 说明)。失败时说明写清卡在哪一步, 便于直接动手。
+
+        password 不为空时, 发现未登录会自动登录 —— 冷启动(App 被退出)和
+        会话失效都会落到未登录态, 此时窗口/导航全都正常, 只有下单必废,
+        所以必须在自检里真查登录态, 而不是等到下单才发现。
         """
         from ApplicationServices import AXIsProcessTrusted
         if not AXIsProcessTrusted():
             return False, "辅助功能未授权"
+
+        if not app_running():
+            if not self.launch_app():
+                return False, "同花顺未运行且拉起失败"
 
         onscreen = self._onscreen_windows()
         try:
@@ -635,10 +1012,24 @@ class ThsAX:
             return False, f"取窗口失败(在屏窗口 {onscreen} 个): {e}"
         if not (attr(win, "AXChildren") or []):
             return False, "窗口 AX 树为空"
+
+        # 登录态要在读资金之前查 —— 未登录时资金区是空的, 若不先查登录,
+        # 报出来的会是"读不到可用金额"这种误导性原因。
+        if self.login_sheet() is not None or not self.logged_in():
+            if not password:
+                return False, "交易未登录(未提供密码, 无法自动登录)"
+            ok, why = self.login(password)
+            if not ok:
+                return False, f"交易未登录且自动登录失败: {why}"
+
         if not self.nav_buttons():
             return False, f"读不到左侧导航栏(在屏窗口 {onscreen} 个)"
 
-        funds = self.read_funds()
+        # 资金区是逐行加载的: 刚登录完常常只出来 总资产/总市值/总盈亏 三行,
+        # 可用金额还要再等几秒(实测冷启动 drill 在这里误报失败)。轮询等它。
+        funds = wait_until(lambda: (f := self.read_funds()) and
+                           "可用金额" in f and f or None,
+                           timeout=20.0, interval=0.5) or self.read_funds()
         if "可用金额" not in funds:
             return False, f"读不到可用金额(资金区字段: {sorted(funds) or '空'})"
 
@@ -648,13 +1039,16 @@ class ThsAX:
             return False, f"打不开委托表: {e}"
         return True, f"可用金额 {funds['可用金额']:,.2f}, 导航与委托表均可读"
 
-    def available_cash(self) -> float | None:
+    def available_cash(self, timeout: float = 10.0) -> float | None:
         """可用金额(可立即用于买入的现金)。读不到返回 None。
 
         返回 None 时调用方应中止下单, 而不是退回某个默认值 —— 拿不准
         账户有多少钱就不该下单。
         """
-        return self.read_funds().get("可用金额")
+        f = wait_until(lambda: (d := self.read_funds()) and
+                       "可用金额" in d and d or None,
+                       timeout=timeout, interval=0.5)
+        return (f or {}).get("可用金额")
 
     # ------------------------------------------------------------------
     # 委托查询
