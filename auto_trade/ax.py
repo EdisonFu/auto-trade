@@ -191,7 +191,36 @@ class ThsAX:
 
         Mac 上关闭窗口不会退出应用,此时 AX 树恒为空。再怎么 activate
         也没用,必须让应用重新开窗 —— 等价于点 Dock 图标。
+
+        2026-11-05 的教训: 原实现只做 activate + "AXRaise of window 1",
+        但窗口全关时根本没有 window 1, 这条必然失败; activate 对已运行却
+        无窗口的 App 也不会开新窗。于是实盘 3 笔全废而唤回毫无作用。
+        改为三级递进, 每级都验证是否已开窗:
+          1. open -b  —— 真正等价于点 Dock 图标, 会让 App 重新开窗
+          2. 菜单「窗口 → ...」第一项
+          3. AXRaise(窗口只是被最小化/遮挡时有效)
         """
+        def opened() -> bool:
+            return self._onscreen_windows() > 0
+
+        # 1) open -b: 对已运行且无窗口的 App, 这是唯一能让它重新开窗的办法
+        subprocess.run(["open", "-b", BUNDLE_ID], capture_output=True)
+        if wait_until(opened, timeout=4.0, interval=0.1, settle=0.3):
+            return
+
+        # 2) 菜单栏「窗口」第一项 —— 多数 Mac App 在此提供"主窗口"
+        subprocess.run(
+            ["osascript", "-e",
+             f'tell application id "{BUNDLE_ID}" to activate',
+             "-e", 'tell application "System Events" to tell process "同花顺" '
+                   'to click menu item 1 of menu 1 of menu bar item "窗口" '
+                   'of menu bar 1'],
+            capture_output=True,
+        )
+        if wait_until(opened, timeout=4.0, interval=0.1, settle=0.3):
+            return
+
+        # 3) 窗口只是被最小化或遮挡时, AXRaise 足够
         subprocess.run(
             ["osascript", "-e",
              f'tell application id "{BUNDLE_ID}" to activate',
@@ -199,8 +228,7 @@ class ThsAX:
                    'to perform action "AXRaise" of window 1'],
             capture_output=True,
         )
-        wait_until(lambda: self._onscreen_windows() > 0,
-                   timeout=4.0, interval=0.1, settle=0.3)
+        wait_until(opened, timeout=4.0, interval=0.1, settle=0.3)
 
     def window(self, timeout: float = 5.0):
         """取主窗口。失焦时 AX 树会塌缩,故轮询而非盲等。"""
@@ -219,17 +247,18 @@ class ThsAX:
         if win is not None:
             return win
 
-        # 还是空 —— 多半是窗口被关掉了,尝试唤回
-        if self._onscreen_windows() == 0:
-            self._reopen_main_window()
-            win = wait_until(ready, timeout=timeout)
-            if win is not None:
-                return win
-            raise AXError(
-                "同花顺进程在运行但没有窗口,自动唤回失败。"
-                "请点 Dock 里的同花顺图标,或用菜单「窗口 → 主窗口」打开主界面。"
-            )
-        raise AXError("AX 树为空,请确认同花顺窗口未最小化且已加载完成")
+        # 还是空 —— 一律尝试唤回主窗口, 不再只在"在屏窗口数为 0"时才试。
+        # 2026-11-05 的教训: 窗口计数与 AX 树是否可用并不等价(窗口可能已
+        # 在屏但 AX 仍塌缩, 或计数本身读失败返回 -1), 用它当唤回的前置条件
+        # 会让真正需要唤回的情况被跳过。唤回本身是幂等的, 多做一次无害。
+        self._reopen_main_window()
+        win = wait_until(ready, timeout=timeout)
+        if win is not None:
+            return win
+        raise AXError(
+            f"同花顺 AX 树为空且自动唤回失败(在屏窗口 {self._onscreen_windows()} 个)。"
+            "请点 Dock 里的同花顺图标, 或用菜单「窗口 → 主窗口」打开主界面。"
+        )
 
     # ------------------------------------------------------------------
     # 面板定位
@@ -585,6 +614,40 @@ class ThsAX:
                     break
         return out
 
+    def ready_to_trade(self) -> tuple[bool, str]:
+        """下单前就绪自检: 逐项验证真正要用到的能力, 而非只看"能取到窗口"。
+
+        2026-11-05 的教训: screen.sh 在 09:18 只检查 window() 能否返回,
+        报告"AX 树可用, 可以交易"; 7 分钟后 09:25 下单时读资金为空、导航栏
+        找不到、委托页签打不开, 3 笔全废。取窗口是弱条件, 下单需要的是读得
+        到资金区、点得到导航、翻得开委托表 —— 必须逐项真测。
+
+        返回 (是否就绪, 说明)。失败时说明写清卡在哪一步, 便于直接动手。
+        """
+        from ApplicationServices import AXIsProcessTrusted
+        if not AXIsProcessTrusted():
+            return False, "辅助功能未授权"
+
+        onscreen = self._onscreen_windows()
+        try:
+            win = self.window(timeout=10.0)
+        except AXError as e:
+            return False, f"取窗口失败(在屏窗口 {onscreen} 个): {e}"
+        if not (attr(win, "AXChildren") or []):
+            return False, "窗口 AX 树为空"
+        if not self.nav_buttons():
+            return False, f"读不到左侧导航栏(在屏窗口 {onscreen} 个)"
+
+        funds = self.read_funds()
+        if "可用金额" not in funds:
+            return False, f"读不到可用金额(资金区字段: {sorted(funds) or '空'})"
+
+        try:
+            self.open_orders_tab()
+        except AXError as e:
+            return False, f"打不开委托表: {e}"
+        return True, f"可用金额 {funds['可用金额']:,.2f}, 导航与委托表均可读"
+
     def available_cash(self) -> float | None:
         """可用金额(可立即用于买入的现金)。读不到返回 None。
 
@@ -838,13 +901,24 @@ class ThsAX:
         for _try in range(max_tries):
             navs = self.nav_buttons()
             if not navs:
-                # 顶部搜索框的下拉面板会遮挡 AX 遍历, 导致读不到左侧导航。
-                # ESC 关不掉(它是独立浮层), 点窗口空白处才行。
+                # 读不到导航栏有两种原因, 必须分开处理:
+                #   窗口不存在 —— Mac 关窗不退进程, AX 树恒空。2026-11-05
+                #     实盘 3 笔全废就是这样: 进程活着但在屏窗口 0 个, 代码
+                #     却一直去 dismiss_overlay(), 点空白处对没有的窗口毫无
+                #     作用, 3 次重试后报"未找到左侧导航栏按钮"。
+                #   浮层遮挡 —— 顶部搜索框下拉面板会挡住 AX 遍历, 这时才
+                #     需要点空白处把它关掉(ESC 关不掉, 它是独立浮层)。
                 if _try < max_tries - 1:
-                    self.dismiss_overlay()
+                    if self._onscreen_windows() == 0:
+                        self._reopen_main_window()
+                    else:
+                        self.dismiss_overlay()
                     time.sleep(0.6)
                     continue
-                raise AXError("未找到左侧导航栏按钮")
+                raise AXError(
+                    "未找到左侧导航栏按钮"
+                    + ("(同花顺无在屏窗口, 自动唤回失败)"
+                       if self._onscreen_windows() == 0 else "(疑有浮层遮挡)"))
 
             # 优先试已知位置(第6项),再回退到全量探测
             order = []
