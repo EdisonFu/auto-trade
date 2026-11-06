@@ -171,7 +171,8 @@ class Runner:
                     break
                 continue
 
-            result = self.trader.place(sig.side, sig.code, price, sig.amount)
+            result = self.trader.place(sig.side, sig.code, price, sig.amount,
+                                       verify=self.cfg.verify_orders)
             executions.append(Execution(
                 asdict(sig), result.status.value, result.msg, resolved_price=price
             ))

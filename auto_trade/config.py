@@ -26,6 +26,12 @@ class Config:
     trade_password: str = field(default="", repr=False)
     self_heal: bool = True   # 每单前自检, 窗口被关/App 退出/掉登录时自动恢复
     max_attempts: int = 3    # 单笔最多尝试次数: 1 原地 → 2 自检恢复 → 3+ 重启同花顺
+    # 每单点完确认后是否立即回查委托表。批量抢时间时应关(False):
+    # 确认框刚关表还没刷, 立刻查会得 0 条而误报 no_record, 还触发一轮
+    # 多余的重试复查 —— 2026-11-06 实测每单因此多花 ~2s。关掉后由调用方
+    # 在批次末统一核对(live_trader 的 _reconcile_and_alert 本来就有)。
+    verify_orders: bool = True
+    ready_cache_s: float = 30.0  # 就绪结果缓存秒数; 批量连续下单不必每单重查
 
     # ---- 时序 ----
     settle: float = 0.3      # 轮询失败时的兜底等待

@@ -51,6 +51,7 @@ class Trader:
         self.ax = ThsAX(settle=self.cfg.settle, key_delay=self.cfg.key_delay)
         self.log = self._logger()
         self._state = self._load()
+        self._ready_at = 0.0
 
     def _logger(self) -> logging.Logger:
         log = logging.getLogger("auto_trade")
@@ -112,17 +113,24 @@ class Trader:
         """
         if not self.cfg.self_heal:
             return True, "self_heal 关闭"
+        # 刚就绪过(默认30s内)就直接放行: 连续下3单时每单都做一遍
+        # login_sheet+nav+funds 三次全树遍历约0.3s, 纯属浪费关键路径时间。
+        if self._ready_at and time.time() - self._ready_at < self.cfg.ready_cache_s:
+            return True, "近期已就绪"
         # 锁屏下快路径会读到空树然后误入完整自检, 先点亮
         self.ax.wake_screen()
         # 已就绪的快路径: 不把每单都拖慢到完整自检(约 2s)
         try:
             if (self.ax.login_sheet() is None and self.ax.nav_buttons()
                     and "可用金额" in self.ax.read_funds()):
+                self._ready_at = time.time()
                 return True, "已就绪"
         except AXError:
             pass
         ok, why = self.ax.ready_to_trade(self.cfg.trade_password or None)
         (self.log.info if ok else self.log.error)("就绪自检: %s", why)
+        if ok:
+            self._ready_at = time.time()
         return ok, why
 
     # 换环境重试也解决不了的结果: 风控拦截/券商拒单/价格被改写/等人工确认。
