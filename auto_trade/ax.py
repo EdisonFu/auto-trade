@@ -61,6 +61,16 @@ class AXError(Exception):
     pass
 
 
+class LoginRefused(AXError):
+    """券商明确拒绝登录(系统测试/维护/密码错误/账户冻结)。重试无用, 须人工处理。"""
+
+
+# 进程内记住最近一次拒绝: 自检、读资金、每笔下单都会各触发一次登录, 不拦的话
+# 一批单就要连打好几次登录接口。到期后放行一次, 券商恢复时还能自己登上。
+REFUSAL_HOLD_S = 120.0
+_last_refusal: tuple[float, str] | None = None
+
+
 def wait_until(cond, timeout: float = 3.0, interval: float = 0.04,
                settle: float = 0.0):
     """轮询直到 cond() 返回真值,返回该值;超时返回 None。
@@ -532,21 +542,63 @@ class ThsAX:
         else:
             time.sleep(self.settle)
 
+    def set_value(self, element, text: str) -> None:
+        """直接写 AXValue 并读回校验。只用于数量/价格框 —— 代码框必须用
+        type_text 发真实按键, 否则同花顺不联动。读回不一致则退回逐键输入。"""
+        AXUIElementSetAttributeValue(element, "AXValue", text)
+        if wait_until(lambda: self.read(element) == text,
+                      timeout=0.5, interval=0.02) is None:
+            self.type_text(element, text)
+
+    def prewarm_codes(self, codes, side: str = "buy",
+                      per_code_timeout: float = 2.0,
+                      deadline: float | None = None) -> dict:
+        """预热股票识别: 逐个输入代码, 等同花顺查出名称/涨跌停, 再清空。
+
+        **绝不点确定买入/卖出**, 只填代码框。目的是让同花顺提前把这些票的
+        基础信息拉到本地, 09:25 真正下单时联动更快。是否真有缓存效果需实测。
+
+        安全: 结束时必须确认下单框完全清空; 清不掉就走完整归位, 仍清不掉
+        抛 AXError —— 调用方应把预热当作可失败的优化, 失败不影响下单。
+        deadline 为 time.time() 截止时刻, 到点立即停止, 给归位留时间。
+        返回 {code: 识别耗时秒 或 None(未识别)}。
+        """
+        out: dict = {}
+        panel = self.reset_to_order_page(side)
+        for code in codes:
+            if deadline is not None and time.time() >= deadline:
+                break
+            t0 = time.time()
+            self.type_text(panel.code, code)
+            st = wait_until(lambda: (lambda x: x if x.recognized else None)(
+                self.read_state(panel)), timeout=per_code_timeout, interval=0.08)
+            out[code] = (time.time() - t0) if st is not None else None
+            if not self.reset(panel):
+                panel = self.reset_to_order_page(side)
+        if not self.reset(panel):
+            self.reset_to_order_page(side)       # 清不掉会抛 AXError
+        return out
+
     def press(self, element) -> None:
         err = AXUIElementPerformAction(element, "AXPress")
         if err != 0:
             raise AXError(f"AXPress 失败 (AXError={err})")
 
     def reset(self, panel: Panel) -> bool:
-        """点[重填]清空表单。"""
+        """点[重填]清空表单, 返回三个输入框是否**确实**已空。
+
+        2026-11-07 修正: 原实现点了按钮就返回 True, 不看结果。
+        reset_to_order_page 的快路径据此认定"面板干净"直接复用, 残留值
+        会一路带到下一单, 最终被确认框核对拦下 —— 不会下错单, 但会漏单。
+        现在轮询到三框都空才算成功; 超时返回 False, 由调用方走完整归位。
+        """
         if panel.reset is None:
             return False
         self.press(panel.reset)
-        wait_until(lambda: not (self.read(panel.code)
-                                or self.read(panel.price)
-                                or self.read(panel.amount)),
-                   timeout=1.5, interval=0.03)
-        return True
+        return bool(wait_until(lambda: not (self.read(panel.code)
+                                            or self.read(panel.price)
+                                            or self.read(panel.amount)),
+                               timeout=1.5, interval=0.03))
 
     # ------------------------------------------------------------------
     # 二次确认框
@@ -899,12 +951,66 @@ class ThsAX:
         except AXError:
             return False
 
+    # 券商拒绝登录的明确答复: 重试也不会变, 必须立即停下交人工。
+    # 2026-11-07 实测周末返回 "[150015][系统测试中，请勿登录]", 旧逻辑不认识,
+    # 重试 3 次后又升级为重启同花顺再登录, 连续打登录接口有锁户风险。
+    LOGIN_REFUSAL_MARKS = ("请勿登录", "系统测试", "系统维护", "暂停服务",
+                           "密码错误", "密码不正确", "账户冻结", "账号冻结",
+                           "账户锁定", "账号锁定", "已锁定", "不在服务时间")
+
+    def find_login_refusal(self) -> dict | None:
+        """登录后弹出的券商拒绝框。返回 {'text','confirm'} 或 None。
+
+        这个框挂在登录框(AXSheet)里, 不在主窗口直接子树中扫得到的位置,
+        find_error_dialog 看不见它, 所以单独遍历同花顺所有窗口。
+        """
+        try:
+            app = AXUIElementCreateApplication(self._pid())
+        except AXError:
+            return None
+        hit, confirm = [], None
+
+        def walk(el, depth=0):
+            nonlocal confirm
+            if depth > 16:
+                return
+            role = str(attr(el, "AXRole") or "")
+            t = str(attr(el, "AXValue") or attr(el, "AXTitle") or "").strip()
+            if role == "AXButton" and t in ("确认", "确定"):
+                confirm = confirm or el
+            elif role == "AXStaticText" and any(m in t for m in self.LOGIN_REFUSAL_MARKS):
+                hit.append(t)
+            for c in attr(el, "AXChildren") or []:
+                walk(c, depth + 1)
+
+        for w in attr(app, "AXWindows") or []:
+            walk(w)
+        if not hit:
+            return None
+        return {"text": " ".join(hit)[:200], "confirm": confirm}
+
+    def dismiss_login_refusal(self) -> str | None:
+        """关掉券商拒绝登录框并返回其正文, 没有则 None。"""
+        dlg = self.find_login_refusal()
+        if dlg is None:
+            return None
+        if dlg["confirm"] is not None:
+            try:
+                self.press(dlg["confirm"])
+                time.sleep(0.4)
+            except AXError:
+                pass
+        return dlg["text"]
+
     def login(self, password: str, *, retries: int = 3) -> tuple[bool, str]:
         """填密码+验证码并登录。密码由调用方传入, 本模块不碰钥匙串。
 
         返回 (是否已登录, 说明)。已登录则直接返回 True。
         验证码偶尔读不全(渲染未完成), 故重试。
         """
+        global _last_refusal
+        if _last_refusal and time.time() - _last_refusal[0] < REFUSAL_HOLD_S:
+            raise LoginRefused(_last_refusal[1])
         if not self.launch_app():
             return False, "同花顺拉起失败"
         if not password:
@@ -964,7 +1070,15 @@ class ThsAX:
                 if self.login_sheet() is not None:
                     return None
                 return "可用金额" in self.read_funds() or None
-            if wait_until(done, timeout=20.0, interval=0.5):
+            def settled():
+                return done() or self.find_login_refusal() or None
+            wait_until(settled, timeout=20.0, interval=0.5)
+            refusal = self.dismiss_login_refusal()
+            if refusal:
+                # 券商明确拒绝: 不重试, 抛给上层, 上层也不得重启同花顺再试
+                _last_refusal = (time.time(), refusal)
+                raise LoginRefused(refusal)
+            if done():
                 return True, f"登录成功(第{n}次)"
             if self.login_sheet() is None and self.logged_in():
                 return True, f"登录成功(第{n}次, 联动确认)"
@@ -1042,7 +1156,10 @@ class ThsAX:
         if self.login_sheet() is not None or not self.logged_in():
             if not password:
                 return False, "交易未登录(未提供密码, 无法自动登录)"
-            ok, why = self.login(password)
+            try:
+                ok, why = self.login(password)
+            except LoginRefused as e:
+                return False, f"券商拒绝登录: {e}"
             if not ok:
                 return False, f"交易未登录且自动登录失败: {why}"
 

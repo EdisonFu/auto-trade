@@ -32,6 +32,10 @@ class Config:
     # 在批次末统一核对(live_trader 的 _reconcile_and_alert 本来就有)。
     verify_orders: bool = True
     ready_cache_s: float = 30.0  # 就绪结果缓存秒数; 批量连续下单不必每单重查
+    # 数量/价格直接写 AXValue 而非逐键输入。代码框不受影响(必须真实键盘
+    # 才会触发同花顺联动)。写入后仍逐项读回, 确认框还会再核对三项, 若应用
+    # 层没收到, 结果是被拦下(漏单)而不是下错单。默认关, 实测验证后再开。
+    fast_fill: bool = False
 
     # ---- 时序 ----
     settle: float = 0.3      # 轮询失败时的兜底等待

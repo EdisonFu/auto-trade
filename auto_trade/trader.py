@@ -13,7 +13,8 @@ from dataclasses import dataclass
 from datetime import date
 from enum import Enum
 
-from .ax import AXError, Panel, PanelState, ThsAX, redact, wait_until
+from .ax import (AXError, LoginRefused, Panel, PanelState, ThsAX,
+                 redact, wait_until)
 from .config import Config
 
 
@@ -52,6 +53,12 @@ class Trader:
         self.log = self._logger()
         self._state = self._load()
         self._ready_at = 0.0
+        # 委托表快照: (读取时刻, 委托列表)。批量下单时由 snapshot_orders()
+        # 先读一次, 各笔从中算防重复基线, 免得每笔都开委托表再切回
+        # (实测每笔 1~2.5s)。只在第一次尝试时使用, 重试仍然现读。
+        self._orders_snap: tuple[float, list] | None = None
+        # 预热刚确认过界面干净: 仅下一笔可跳过报错框扫描, 用后即清
+        self._last_clean = False
 
     def _logger(self) -> logging.Logger:
         log = logging.getLogger("auto_trade")
@@ -138,23 +145,52 @@ class Trader:
     _FINAL = {Status.FILLED_ONLY, Status.SUBMITTED, Status.BLOCKED,
               Status.PRICE_DRIFT, Status.AWAITING_CONFIRM}
 
-    def _count_orders(self, side: str, code: str, amount: int) -> int | None:
+    def snapshot_orders(self, side: str = "buy") -> bool:
+        """批量下单前读一次委托表作为防重复基线, 读完回到下单页。
+
+        返回是否读到。读不到时各笔退回逐笔现读(旧行为)。
+        """
+        try:
+            self.ax.open_orders_tab()
+            orders = self.ax.read_orders()
+        except AXError as exc:
+            self.log.warning("委托表快照失败, 改为逐笔读取: %s", exc)
+            self._orders_snap = None
+            return False
+        self._orders_snap = (time.time(), orders)
+        try:
+            self.ax.reset_to_order_page(side)
+        except AXError as exc:
+            self.log.warning("快照后归位失败(下单时会重新归位): %s", exc)
+        return True
+
+    @staticmethod
+    def _match_count(orders: list, side: str, code: str, amount: int) -> int:
+        want = "买入" if side == "buy" else "卖出"
+        return sum(1 for o in orders
+                   if str(o.get("证券代码", "")).strip() == code
+                   and want in str(o.get("操作", ""))
+                   and str(o.get("委托数量", "")).strip() == str(amount))
+
+    def _count_orders(self, side: str, code: str, amount: int,
+                      use_snapshot: bool = False) -> int | None:
         """委托表里 同代码+同方向+同数量 的条数; 读不到返回 None。
 
         用"下单前后条数是否增加"判断这单报没报出去, 不怕撞上当天同一只票
-        的历史委托(含废单)。
+        的历史委托(含废单)。use_snapshot=True 且有 5 分钟内的快照时用快照,
+        否则现读。快照只适合做"第一次尝试前"的基线: 若快照之后本程序已对
+        同一只票下过单, 基线会偏低 —— 这种情况由批次内去重(同代码合并)排除。
         """
-        want = "买入" if side == "buy" else "卖出"
+        if use_snapshot and self._orders_snap is not None \
+                and time.time() - self._orders_snap[0] < 300:
+            return self._match_count(self._orders_snap[1], side, code, amount)
         try:
             self.ax.open_orders_tab()
             orders = self.ax.read_orders()
         except AXError as exc:
             self.log.warning("读委托表失败: %s", exc)
             return None
-        return sum(1 for o in orders
-                   if str(o.get("证券代码", "")).strip() == code
-                   and want in str(o.get("操作", ""))
-                   and str(o.get("委托数量", "")).strip() == str(amount))
+        return self._match_count(orders, side, code, amount)
 
     def restart_app(self) -> tuple[bool, str]:
         """退出同花顺 → 冷启动 → 登录 → 自检。最重的一级恢复。"""
@@ -200,10 +236,16 @@ class Trader:
                 self.log.error("第%d次: 同花顺未就绪: %s", n, why)
                 res = Result(Status.ERROR, side, code, price_str, amount_str,
                              msg=f"同花顺未就绪: {why}")
+                if why.startswith("券商拒绝登录"):
+                    # 券商明确拒绝(系统测试/密码错/冻结): 重试和重启同花顺都
+                    # 只会再打登录接口, 有锁户风险。立即停下交人工。
+                    res.msg = f"[已停止: {why}, 请人工处理]"
+                    return res
                 continue
 
             if do_submit:
-                cnt = self._count_orders(side, code, amount)
+                cnt = self._count_orders(side, code, amount,
+                                         use_snapshot=(n == 1))
                 if baseline is None:
                     baseline = cnt
                 elif cnt is not None and cnt > baseline:
@@ -248,8 +290,12 @@ class Trader:
 
         try:
             # 上一单可能留下警告框/确认框, 不清掉会让本单读到别人的确认框
-            # 而报"证券代码与预期不符"。
-            self.ax.dismiss_error_dialog()
+            # 而报"证券代码与预期不符"。只有预热刚确认界面干净时才跳过这次整树
+            # 扫描(约 0.25s)。点确认之后不能跳: 券商拒单的警告框正是确认后才弹,
+            # 不关掉会挡住下一笔。
+            if not self._last_clean:
+                self.ax.dismiss_error_dialog()
+            self._last_clean = False
             panel = self.switch(side)
 
             # 1) 代码 —— 必须先填,同花顺据此联动
@@ -275,10 +321,13 @@ class Trader:
                 return Result(Status.UNRECOGNIZED, side, code, price_str,
                               amount_str, st, msg)
 
-            # 2) 数量
-            self.ax.type_text(panel.amount, amount_str)
-            # 3) 价格 —— 放最后,因为填代码会被同花顺改写成现价
-            self.ax.type_text(panel.price, price_str)
+            # 2) 数量  3) 价格 —— 价格放最后, 因为填代码会被同花顺改写成现价
+            if self.cfg.fast_fill:
+                self.ax.set_value(panel.amount, amount_str)
+                self.ax.set_value(panel.price, price_str)
+            else:
+                self.ax.type_text(panel.amount, amount_str)
+                self.ax.type_text(panel.price, price_str)
 
             st = self.ax.read_state(panel)
 
