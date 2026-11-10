@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import logging
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -29,6 +30,8 @@ from Cocoa import NSRunningApplication
 
 BUNDLE_ID = "cn.com.10jqka.macstockPro"
 APP_PATH = "/Applications/同花顺.app"
+
+_LOG = logging.getLogger("auto_trade")
 
 
 def running_apps():
@@ -514,6 +517,7 @@ class ThsAX:
           * 输入后轮询读回,值对了立刻返回。
         """
         self.focus(element)
+        t0 = time.perf_counter()
 
         if clear_first and self.read(element):
             for _ in range(16):
@@ -535,9 +539,13 @@ class ThsAX:
                 # 键盘路径失败(多见于退格没清干净导致新值追加不进去):
                 # 回退到 AXValue 直写。实测同花顺能收到并触发联动,
                 # 仍以 read_state() 的联动字段作为最终判据。
+                _LOG.warning("输入回退: 键盘读回超时 %.2fs, 改用 AXValue 直写",
+                             time.perf_counter() - t0)
                 AXUIElementSetAttributeValue(element, "AXValue", text)
                 if wait_until(lambda: self.read(element) == text,
                               timeout=1.0, interval=0.02) is None:
+                    _LOG.warning("AXValue 直写读回仍不一致, 等待 settle %.2fs",
+                                 self.settle)
                     time.sleep(self.settle)
         else:
             time.sleep(self.settle)
@@ -548,6 +556,7 @@ class ThsAX:
         AXUIElementSetAttributeValue(element, "AXValue", text)
         if wait_until(lambda: self.read(element) == text,
                       timeout=0.5, interval=0.02) is None:
+            _LOG.warning("set_value 读回不一致, 回退键盘输入")
             self.type_text(element, text)
 
     def prewarm_codes(self, codes, side: str = "buy",
@@ -595,10 +604,13 @@ class ThsAX:
         if panel.reset is None:
             return False
         self.press(panel.reset)
-        return bool(wait_until(lambda: not (self.read(panel.code)
-                                            or self.read(panel.price)
-                                            or self.read(panel.amount)),
-                               timeout=1.5, interval=0.03))
+        ok = bool(wait_until(lambda: not (self.read(panel.code)
+                                          or self.read(panel.price)
+                                          or self.read(panel.amount)),
+                             timeout=1.5, interval=0.03))
+        if not ok:
+            _LOG.warning("reset 清空未确认, 进入完整归位")
+        return ok
 
     # ------------------------------------------------------------------
     # 二次确认框
@@ -764,7 +776,6 @@ class ThsAX:
             if depth > 16:
                 return
             role = str(attr(el, "AXRole") or "")
-            x, y, _w, _h = geom(el)
             text = str(
                 attr(el, "AXValue") or attr(el, "AXTitle")
                 or attr(el, "AXDescription") or ""
@@ -788,9 +799,13 @@ class ThsAX:
         found["text"] = " | ".join(detail)
         return found
 
-    def confirm_order(self) -> str:
-        """点击确认框的[确认]。返回确认框摘要文本。"""
-        dlg = self.find_confirm_dialog()
+    def confirm_order(self, dlg: dict | None = None) -> str:
+        """点击确认框的[确认]。返回确认框摘要文本。
+
+        dlg 为调用方刚找到的确认框时直接复用, 避免确认前重复整树扫描；
+        省略时保持原查找行为。"""
+        if dlg is None:
+            dlg = self.find_confirm_dialog()
         if dlg is None:
             raise AXError("未找到二次确认框")
         text = dlg["text"]
@@ -1329,8 +1344,13 @@ class ThsAX:
             cur = self.find_panel()
             want0 = "买入" if side == "buy" else "卖出"
             if cur.direction == want0 and self.find_confirm_dialog() is None:
-                # reset 返回 False 说明[重填]没清干净(上一单残留),
-                # 此时必须走完整归位, 否则下一单会填进脏面板导致联动失败。
+                # 三个输入框均已确认空白(连续两次读回)时面板可复用,
+                # 避免每笔重复点击[重填]。有残留则仍走 reset + 完整归位。
+                if not (self.read(cur.code) or self.read(cur.price)
+                        or self.read(cur.amount)):
+                    if not (self.read(cur.code) or self.read(cur.price)
+                            or self.read(cur.amount)):
+                        return cur
                 if self.reset(cur):
                     return cur
         except AXError:

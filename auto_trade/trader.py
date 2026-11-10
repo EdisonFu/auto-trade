@@ -244,11 +244,17 @@ class Trader:
                     return res
                 continue
 
-            self.log.info("下单计时 %s 第%d次 就绪检查 %.3fs",
-                          code, n, time.perf_counter() - _step_t0)
+            self.log.info("下单计时 %s 第%d次 就绪检查 %.3fs (%s)",
+                          code, n, time.perf_counter() - _step_t0, why)
             if do_submit:
+                _cnt_t0 = time.perf_counter()
                 cnt = self._count_orders(side, code, amount,
                                          use_snapshot=(n == 1))
+                _snap_used = (self._orders_snap is not None
+                              and time.time() - self._orders_snap[0] < 300)
+                self.log.info("下单计时 %s 第%d次 防重复基线 %.3fs (%s)",
+                              code, n, time.perf_counter() - _cnt_t0,
+                              "快照" if (_snap_used and n == 1) else "现读")
                 if baseline is None:
                     baseline = cnt
                 elif cnt is not None and cnt > baseline:
@@ -326,6 +332,7 @@ class Trader:
             )
             if st is None:
                 st = self.ax.read_state(panel)
+                self.log.warning("识别股票等待超时 %.3fs", time.perf_counter() - _t0)
             _mark("识别股票")
             if self.cfg.require_recognized and not st.recognized:
                 msg = f"同花顺未识别 {code}(联动字段为空),拒绝提交"
@@ -441,7 +448,7 @@ class Trader:
                     return Result(Status.BLOCKED, side, code, price_str,
                                   amount_str, None, msg)
 
-            self.ax.confirm_order()
+            self.ax.confirm_order(dlg)
             _mark("确认报出")
             self._state["count"] += 1
             self._state["turnover"] += price * amount
