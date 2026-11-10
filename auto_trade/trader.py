@@ -226,6 +226,7 @@ class Trader:
         baseline: int | None = None
         res: Result | None = None
         for n in range(1, attempts + 1):
+            _step_t0 = time.perf_counter()
             if n == 1:
                 ok, why = self.ensure_ready()
             elif n == 2:
@@ -243,6 +244,8 @@ class Trader:
                     return res
                 continue
 
+            self.log.info("下单计时 %s 第%d次 就绪检查 %.3fs",
+                          code, n, time.perf_counter() - _step_t0)
             if do_submit:
                 cnt = self._count_orders(side, code, amount,
                                          use_snapshot=(n == 1))
@@ -287,6 +290,11 @@ class Trader:
         price_str = f"{price:.2f}"
         amount_str = str(amount)
         maybe_sent = False
+        _t0 = time.perf_counter()
+
+        def _mark(label: str) -> None:
+            self.log.info("下单计时 %s %s %.3fs", code, label,
+                          time.perf_counter() - _t0)
 
         try:
             # 上一单可能留下警告框/确认框, 不清掉会让本单读到别人的确认框
@@ -296,12 +304,15 @@ class Trader:
             if not self._last_clean:
                 self.ax.dismiss_error_dialog()
             self._last_clean = False
+            _mark("清错误框")
             panel = self.switch(side)
+            _mark("归位下单页")
 
             # 1) 代码 —— 必须先填,同花顺据此联动
             # 联动是异步的(要回服务端查名称/涨跌停),填完立刻读会得到空值,
             # 故轮询等到 recognized 或超时。
             self.ax.type_text(panel.code, code)
+            _mark("填代码")
             # 页面重建后旧引用写入会静默失败(值进不去也不报错),
             # 检测到没写进去就重新定位面板再试一次。
             if (self.ax.read(panel.code) or "").strip() != code:
@@ -315,6 +326,7 @@ class Trader:
             )
             if st is None:
                 st = self.ax.read_state(panel)
+            _mark("识别股票")
             if self.cfg.require_recognized and not st.recognized:
                 msg = f"同花顺未识别 {code}(联动字段为空),拒绝提交"
                 self.log.error(msg + " | " + st.summary())
@@ -328,6 +340,7 @@ class Trader:
             else:
                 self.ax.type_text(panel.amount, amount_str)
                 self.ax.type_text(panel.price, price_str)
+            _mark("填数量价格")
 
             st = self.ax.read_state(panel)
 
@@ -378,6 +391,7 @@ class Trader:
             self.log.info("点击[%s]", panel.submit_title)
             maybe_sent = True
             self.ax.press(panel.submit)
+            _mark("点击确定")
             # 轮询确认框出现,不盲等 —— 通常 200~400ms 就弹出来了
             dlg = wait_until(self.ax.find_confirm_dialog,
                              timeout=max(self.cfg.post_submit_wait * 2, 3.0),
@@ -400,6 +414,7 @@ class Trader:
 
             self.log.info("二次确认框: %s", redact(dlg["text"].replace("\n", " "))[:120])
 
+            _mark("确认框出现")
             if not self.cfg.auto_confirm:
                 return Result(Status.AWAITING_CONFIRM, side, code, price_str,
                               amount_str, None,
@@ -428,6 +443,7 @@ class Trader:
                                   amount_str, None, msg)
 
             self.ax.confirm_order()
+            _mark("确认报出")
             self._state["count"] += 1
             self._state["turnover"] += price * amount
             self._save()
