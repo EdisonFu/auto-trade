@@ -126,6 +126,8 @@ class Trader:
             return True, "近期已就绪"
         # 锁屏下快路径会读到空树然后误入完整自检, 先点亮
         self.ax.wake_screen()
+        # 每批首次确保前台(缓存命中不再激活): 后台时CGEvent会落到别的App
+        self.ax.ensure_frontmost()
         # 已就绪的快路径: 不把每单都拖慢到完整自检(约 2s)
         try:
             if (self.ax.login_sheet() is None and self.ax.nav_buttons()

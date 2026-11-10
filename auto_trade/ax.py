@@ -247,6 +247,16 @@ class ThsAX:
         return bool(wait_until(tree_ready, timeout=timeout, interval=0.3,
                                settle=0.5))
 
+    def ensure_frontmost(self) -> None:
+        """键盘/鼠标操作前确保同花顺在前台。
+
+        已在前台只做一次 isActive 检查, 不调用 osascript, 正常路径零额外等待;
+        在后台才 activate —— 否则 CGEvent 会落到其他 App, 触发约 1s 的
+        键盘读回超时 + AXValue 回退(2026-11-10 失焦演练 1.4s→5.7s 实测)。"""
+        apps = running_apps()
+        if apps and not any(app.isActive() for app in apps):
+            self.activate()
+
     def activate(self, timeout: float = 3.0) -> None:
         """激活同花顺并等它真正到前台(轮询,不盲等)。"""
         subprocess.run(
@@ -516,6 +526,7 @@ class ThsAX:
           * 退格按到框空为止,而不是固定敲 12 次;
           * 输入后轮询读回,值对了立刻返回。
         """
+        self.ensure_frontmost()      # 失焦时键盘事件会丢, 先保证前台
         self.focus(element)
         t0 = time.perf_counter()
 

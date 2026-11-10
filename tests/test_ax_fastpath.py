@@ -140,6 +140,68 @@ class TestFastPathPanel(unittest.TestCase):
         self.assertIn("dismiss", calls)
 
 
+class TestFrontmost(unittest.TestCase):
+    class _App:
+        def __init__(self, active):
+            self._active = active
+
+        def isActive(self):
+            return self._active
+
+    def test_active_no_activate(self):
+        ax = A.ThsAX()
+        calls = []
+        ax.activate = lambda: calls.append(1)
+        real = A.running_apps
+        A.running_apps = lambda: [self._App(True)]
+        try:
+            ax.ensure_frontmost()
+        finally:
+            A.running_apps = real
+        self.assertEqual(calls, [])
+
+    def test_background_activates(self):
+        ax = A.ThsAX()
+        calls = []
+        ax.activate = lambda: calls.append(1)
+        real = A.running_apps
+        A.running_apps = lambda: [self._App(False)]
+        try:
+            ax.ensure_frontmost()
+        finally:
+            A.running_apps = real
+        self.assertEqual(calls, [1])
+
+    def test_type_text_checks_front_before_focus(self):
+        ax = A.ThsAX()
+        seq = []
+        ax.ensure_frontmost = lambda: seq.append("front")
+        ax.focus = lambda el: seq.append("focus")
+        ax.read = lambda el: ""
+        ax._key = lambda k: None
+        ax.settle = 0.0
+        ax.type_text(object(), "1", clear_first=False, verify=False)
+        self.assertEqual(seq, ["front", "focus"])
+
+    def test_ensure_ready_activates_once_per_batch(self):
+        from auto_trade import Config
+        from auto_trade.trader import Trader
+        tr = Trader(Config(dry_run=True, state_file="/tmp/at_ff_state.json",
+                           log_file="/tmp/at_ff.log"))
+        seq = []
+        tr.ax.wake_screen = lambda: None
+        tr.ax.ensure_frontmost = lambda: seq.append("front")
+        tr.ax.login_sheet = lambda: None
+        tr.ax.nav_buttons = lambda: [(1, 100.0, object())]
+        tr.ax.read_funds = lambda: {"可用金额": 100.0}
+        ok, _ = tr.ensure_ready()
+        self.assertTrue(ok)
+        self.assertEqual(seq, ["front"])
+        ok, _ = tr.ensure_ready()
+        self.assertTrue(ok)
+        self.assertEqual(seq, ["front"])   # 缓存命中, 不再激活
+
+
 class TestFastFillGuards(unittest.TestCase):
     def test_fast_fill_uses_set_value_only_for_amount_price(self):
         tr = Trader(Config(dry_run=True, fast_fill=True, trade_password="x",
