@@ -387,7 +387,6 @@ class Trader:
                               amount_str, st, "dry_run:已填值未提交")
 
             # 4) 点[确定买入/卖出] —— 这一步只会弹出二次确认框,并未报单
-            import time
             self.log.info("点击[%s]", panel.submit_title)
             maybe_sent = True
             self.ax.press(panel.submit)
