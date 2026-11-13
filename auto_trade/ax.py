@@ -12,9 +12,13 @@
 from __future__ import annotations
 
 import logging
+import os
+import signal
 import subprocess
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
 
 import Quartz
 from ApplicationServices import (
@@ -30,6 +34,8 @@ from Cocoa import NSRunningApplication
 
 BUNDLE_ID = "cn.com.10jqka.macstockPro"
 APP_PATH = "/Applications/同花顺.app"
+# 遮挡弹窗截图目录(state/ 不入库)
+SHOT_DIR = Path(__file__).resolve().parent.parent / "state"
 
 _LOG = logging.getLogger("auto_trade")
 
@@ -72,6 +78,30 @@ class LoginRefused(AXError):
 # 一批单就要连打好几次登录接口。到期后放行一次, 券商恢复时还能自己登上。
 REFUSAL_HOLD_S = 120.0
 _last_refusal: tuple[float, str] | None = None
+
+# 本进程处理过的遮挡弹窗: [{"at","bounds","text","action","shot"}]。
+# 由上层(live_trader)取走发邮件, 让人事后知道发生过什么、点了什么。
+BLOCKER_EVENTS: list[dict] = []
+
+
+def pop_blocker_events() -> list[dict]:
+    """取走并清空已记录的遮挡弹窗事件。"""
+    out = list(BLOCKER_EVENTS)
+    BLOCKER_EVENTS.clear()
+    return out
+
+
+def screen_capture_allowed() -> bool:
+    """本进程有没有屏幕录制权限。没有就截不到弹窗、OCR 不了, 只能重启。
+
+    2026-11-13 实测: 终端里 True, launchd 拉起的同一 python 却是 False
+    (和辅助功能同样的 TCC 责任进程问题), screencapture 报
+    "could not create image"。
+    """
+    try:
+        return bool(Quartz.CGPreflightScreenCaptureAccess())
+    except Exception:                                       # noqa: BLE001
+        return False
 
 
 def wait_until(cond, timeout: float = 3.0, interval: float = 0.04,
@@ -187,24 +217,45 @@ class ThsAX:
         """退出同花顺。主要给测试/演练造冷启动态用。
 
         osascript quit 会被挂起的确认框挡住并报 -128(用户已取消), 所以逐级
-        加力: quit → terminate → kill -9。注意进程名是"同花顺"而非 bundle id,
-        pkill -f 10jqka 匹配不到。
+        加力: quit → terminate → forceTerminate → SIGKILL。注意进程名是"同花顺"
+        而非 bundle id, pkill -f 10jqka 匹配不到。
+
+        2026-11-13 的教训: 券商重登弹窗挂着时 quit/terminate/forceTerminate
+        25s 都没退掉, 只报"退出失败"不知卡在哪级。现在每级都记日志, 并以
+        os.kill(SIGKILL) 兜底。
         """
-        subprocess.run(
-            ["osascript", "-e", f'tell application id "{BUNDLE_ID}" to quit'],
-            capture_output=True)
-        if wait_until(lambda: not app_running() or None, timeout=5.0,
-                      interval=0.3):
+        def gone(t):
+            return bool(wait_until(lambda: not app_running() or None,
+                                   timeout=t, interval=0.3))
+
+        try:
+            subprocess.run(
+                ["osascript", "-e", f'tell application id "{BUNDLE_ID}" to quit'],
+                capture_output=True, timeout=10)
+        except subprocess.TimeoutExpired:
+            _LOG.warning("同花顺 osascript quit 10s 无响应")
+        if gone(5.0):
             return True
+        _LOG.warning("同花顺 quit 未退出, 改 terminate")
         for app in running_apps():
             app.terminate()
-        if wait_until(lambda: not app_running() or None, timeout=5.0,
-                      interval=0.3):
+        if gone(5.0):
             return True
+        _LOG.warning("同花顺 terminate 未退出, 改 forceTerminate")
         for app in running_apps():
             app.forceTerminate()
-        return bool(wait_until(lambda: not app_running() or None,
-                               timeout=timeout, interval=0.3))
+        if gone(5.0):
+            return True
+        _LOG.warning("同花顺 forceTerminate 未退出, 改 SIGKILL")
+        for app in running_apps():
+            try:
+                os.kill(app.processIdentifier(), signal.SIGKILL)
+            except OSError as e:
+                _LOG.error("SIGKILL 同花顺失败: %s", e)
+        if gone(timeout):
+            return True
+        _LOG.error("同花顺 SIGKILL 后仍在运行")
+        return False
 
     def launch_app(self, timeout: float = 40.0) -> bool:
         """同花顺没在跑就拉起来, 等到 AX 主窗口真的有内容。
@@ -710,6 +761,345 @@ class ThsAX:
                 return b["X"], b["Y"], b["Width"], b["Height"]
         return None
 
+    def _ax_window_bounds(self) -> list[tuple[float, float, float, float]]:
+        """不算遮挡的同花顺窗口边界: 主窗口, 及交易登录 sheet。
+
+        只认主窗口(_main_of, 子节点最多的标准窗口)与 login_sheet()。
+        23:39 实测「当日盈亏」提示框([已知晓]) 是主窗口下的 AXSheet, AX
+        看得见, 同样让[确定卖出]不弹确认框 —— 所以不能放行任意 sheet,
+        只放行有密码框+[登录]的那一个, 它交给 ready_to_trade 的登录流程。
+        """
+        try:
+            app = AXUIElementCreateApplication(self._pid())
+        except AXError:
+            return []
+        main = self._main_of(app)
+        if main is None:
+            return []
+        out = [geom(main)]
+        sheet = self.login_sheet()
+        if sheet is not None:
+            out.append(geom(sheet))
+        return out
+
+    def find_blocking_window(self) -> dict | None:
+        """压在主窗口上的同花顺弹窗(主窗口和登录 sheet 以外)。没有返回 None。
+
+        2026-11-13 的教训:
+          * 09:25 券商断线后弹出 453x292 的「交易重新登录」小窗(带图片验证码)。
+            它不在 AXWindows 里, AX 树里的主窗口照常可读, 自检(资金/导航/
+            委托表)全部通过; 但主窗口被它锁住, 点[确定买入]不弹确认框,
+            买卖 6 笔全失败。
+          * 23:39 下单测试又遇到 454x276 的「当日盈亏」提示([已知晓])。
+            这个 AX 看得见(主窗口下的 AXSheet), 但同样锁住主窗口。
+        所以判据是: 在屏、0 层、足够大, 且尺寸不是主窗口或登录 sheet。
+        不依赖文案、坐标, 也不依赖 AX 看不看得见。「"密码"已锁定」框另由
+        dismiss_password_unlock 处理, 这里排除。
+
+        熄屏时窗口服务器报 0 个在屏窗口, 会静默漏判 —— 实测 22:43 熄屏下查
+        不到, 点亮后立即查到。故主窗口不在屏时先点亮并激活再查。
+        """
+        try:
+            pid = self._pid()
+        except AXError:
+            return None
+        if self._onscreen_windows() <= 0:
+            subprocess.run(["caffeinate", "-u", "-t", "2"], capture_output=True)
+            self.activate(timeout=3.0)
+            time.sleep(0.8)              # 等切换桌面的滑动动画结束, 坐标才稳定
+        wins = Quartz.CGWindowListCopyWindowInfo(
+            Quartz.kCGWindowListOptionOnScreenOnly
+            | Quartz.kCGWindowListExcludeDesktopElements,
+            Quartz.kCGNullWindowID,
+        ) or []
+        cand = []
+        for w in wins:
+            if w.get("kCGWindowOwnerPID") != pid or w.get("kCGWindowLayer", 0) != 0:
+                continue
+            b = w.get("kCGWindowBounds") or {}
+            bw, bh = b.get("Width", 0), b.get("Height", 0)
+            if bw < 200 or bh < 120:
+                continue                     # 断线 toast 等小提示不挡操作
+            if 400 <= bw <= 480 and 480 <= bh <= 550:
+                continue                     # 密码解锁框, 见 find_password_unlock
+            cand.append((w.get("kCGWindowNumber"), b))
+        if not cand:
+            return None
+        known = self._ax_window_bounds()
+
+        def matches(b, g):
+            # 只比尺寸不比位置: 激活时主窗口切换桌面会滑动, 窗口服务器
+            # 报 x=-1532 而 AX 报 x=0, 按位置比会把主窗口误判成遮挡窗
+            # (22:45 实测), 无故重启要 35s。
+            _x, _y, gw, gh = g
+            return (abs(b.get("Width", 0) - gw) <= 2
+                    and abs(b.get("Height", 0) - gh) <= 2)
+
+        for wid, b in cand:
+            if not any(matches(b, g) for g in known):
+                return {"id": wid, "bounds": (b.get("X", 0), b.get("Y", 0),
+                                              b.get("Width", 0), b.get("Height", 0))}
+        return None
+
+    # 不算遮挡的系统常驻层(进程名随系统语言变, 如 Dock 叫"程序坞"):
+    # 菜单栏、Dock 透明全屏层等。另按"覆盖整个屏幕"一并排除。
+    _OVERLAY_OWNERS_IGNORE = ("Window Server", "Dock", "程序坞", "控制中心",
+                              "Control Center", "SystemUIServer", "通知中心",
+                              "NotificationCenter", "Notification Center")
+
+    def find_foreign_overlay(self) -> list[dict]:
+        """压在同花顺主窗口**上面**、又与它重叠的其他进程窗口。只报告, 不点。
+
+        系统更新提示、权限申请、低电量、其他 App 的弹窗都属于这一类:
+        它们不在同花顺里, find_blocking_window 看不到; 点它们的按钮风险
+        不可控(可能是"立即重启"), 所以只记录并让上层告警。窗口列表按
+        前后顺序返回, 主窗口之前出现的才算压在上面。
+        """
+        try:
+            pid = self._pid()
+        except AXError:
+            return []
+        wins = Quartz.CGWindowListCopyWindowInfo(
+            Quartz.kCGWindowListOptionOnScreenOnly
+            | Quartz.kCGWindowListExcludeDesktopElements,
+            Quartz.kCGNullWindowID,
+        ) or []
+        main, main_i = None, None
+        for i, w in enumerate(wins):                     # 前 → 后
+            if w.get("kCGWindowOwnerPID") == pid and w.get("kCGWindowLayer", 0) == 0:
+                b = w.get("kCGWindowBounds") or {}
+                if b.get("Width", 0) >= 800:
+                    main, main_i = b, i
+                    break
+        if main is None:
+            return []
+        out = []
+        for w in wins[:main_i]:
+            b = w.get("kCGWindowBounds") or {}
+            if w.get("kCGWindowOwnerPID") == pid:
+                continue
+            owner = str(w.get("kCGWindowOwnerName") or "")
+            if owner in self._OVERLAY_OWNERS_IGNORE or w.get("kCGWindowAlpha", 1) < 0.2:
+                continue
+            if b.get("Width", 0) < 120 or b.get("Height", 0) < 60:
+                continue
+            if b.get("Y", 0) <= 0 and b.get("Height", 0) >= main["Y"] + main["Height"]:
+                continue                     # 全屏透明层(Dock/截图工具等)
+            ix = min(b["X"] + b["Width"], main["X"] + main["Width"]) - max(b["X"], main["X"])
+            iy = min(b["Y"] + b["Height"], main["Y"] + main["Height"]) - max(b["Y"], main["Y"])
+            if ix > 0 and iy > 0:
+                out.append({"owner": owner, "layer": w.get("kCGWindowLayer", 0),
+                            "bounds": (b["X"], b["Y"], b["Width"], b["Height"])})
+        return out
+
+    @staticmethod
+    def capture_window(bounds) -> str | None:
+        """按屏幕区域截取弹窗存到 state/, 返回路径; 失败返回 None(截图不影响自愈)。
+
+        不用 screencapture -l <窗口号>: 23:47 实测主窗口下的 sheet 弹窗用 -l
+        截出来是整屏(3024x1718), OCR 坐标按弹窗尺寸换算后点偏, 连点 4 次
+        都没点中[已知晓]。按区域截 (-R) 拿到的就是弹窗所在矩形里最上层
+        的画面, 坐标比例与弹窗一一对应。熄屏时截不到, 先点亮。
+        """
+        try:
+            SHOT_DIR.mkdir(parents=True, exist_ok=True)
+            path = SHOT_DIR / f"blocker_{datetime.now():%Y%m%d_%H%M%S}.png"
+            x, y, w, h = (int(round(v)) for v in bounds)
+            for _ in range(2):
+                if ThsAX._onscreen_windows() <= 0:   # 熄屏才点亮, 它会阻塞 1s
+                    subprocess.run(["caffeinate", "-u", "-t", "1"],
+                                   capture_output=True)
+                subprocess.run(["screencapture", "-x", "-R", f"{x},{y},{w},{h}",
+                                str(path)], capture_output=True, timeout=10)
+                if path.exists():
+                    return str(path)
+                time.sleep(0.5)
+            _LOG.warning("遮挡弹窗截图失败(区域 %s)", bounds)
+            return None
+        except Exception as e:                              # noqa: BLE001
+            _LOG.warning("遮挡弹窗截图失败: %s", e)
+            return None
+
+    # 遮挡弹窗里可以安全点掉的按钮(按优先级)。只收"不提交任何东西"的:
+    # 确定/确认/登录 一律不点 —— 它们可能报单或登录, 交给重启兜底。
+    SAFE_BUTTONS = ("取消", "已知晓", "我知道了", "知道了", "关闭", "完成")
+    # 出现这些字样说明是交易登录框, 一个按钮都不点
+    LOGIN_MARKS = ("交易密码", "验证码", "交易帐户", "交易账户")
+
+    @staticmethod
+    def ocr_image(path: str) -> list[tuple[str, float, float, float, float]]:
+        """macOS Vision 识别截图文字, 返回 [(文字, 中心x比例, 中心y比例, 宽比例, 高比例)]。
+
+        比例以图片左上角为原点, 与窗口坐标同向。Vision 不可用返回 [],
+        调用方退回重启方案。耗时约 0.5s。
+        """
+        try:
+            import Vision                                    # noqa: PLC0415
+            from Foundation import NSURL                     # noqa: PLC0415
+        except ImportError:
+            _LOG.warning("未安装 pyobjc-framework-Vision, 遮挡弹窗只能重启处理")
+            return []
+        src = Quartz.CGImageSourceCreateWithURL(NSURL.fileURLWithPath_(path), None)
+        img = Quartz.CGImageSourceCreateImageAtIndex(src, 0, None) if src else None
+        if img is None:
+            return []
+        req = Vision.VNRecognizeTextRequest.alloc().init()
+        req.setRecognitionLanguages_(["zh-Hans", "en-US"])
+        req.setRecognitionLevel_(0)                          # accurate
+        h = Vision.VNImageRequestHandler.alloc().initWithCGImage_options_(img, None)
+        if not h.performRequests_error_([req], None)[0]:
+            return []
+        out = []
+        for r in req.results() or []:
+            bb = r.boundingBox()                             # 左下原点, 0~1
+            out.append((str(r.topCandidates_(1)[0].string()).strip(),
+                        bb.origin.x + bb.size.width / 2,
+                        1 - bb.origin.y - bb.size.height / 2,
+                        bb.size.width, bb.size.height))
+        return out
+
+    def _click_safe_button(self, blk: dict,
+                           shot: str | None) -> tuple[str | None, str]:
+        """OCR 截图, 找到白名单按钮就点。返回 (点掉的按钮名或 None, 弹窗文字)。
+
+        按钮文字必须**完整等于**白名单项(正文里的"取消"二字不算), 且只点
+        一次; 点完是否真的消失由调用方复查。
+        """
+        if not shot:
+            return None, ""
+        words = self.ocr_image(shot)
+        text = " ".join(t for t, *_ in words)[:200]
+        # 券商交易重登框(11-13 09:25): 点[取消]只是关掉框, 会话仍是断的,
+        # 而资金区还显示缓存数据, 登录检查会误判已登录。交给重启重登。
+        if any(k in text for k in self.LOGIN_MARKS):
+            _LOG.warning("遮挡弹窗疑似交易登录框, 不点[取消], 改重启重登: %s",
+                         redact(text)[:80])
+            return None, text
+        found = {t: (cx, cy) for t, cx, cy, _w, _h in words}
+        for name in self.SAFE_BUTTONS:
+            if name in found:
+                cx, cy = found[name]
+                x, y, w, h = blk["bounds"]
+                self.activate(timeout=3.0)
+                self._click_at(x + w * cx, y + h * cy)
+                _LOG.warning("遮挡弹窗点击[%s] (正文: %s)", name, redact(text)[:80])
+                return name, text
+        _LOG.warning("遮挡弹窗未找到可安全点击的按钮, 识别到: %s",
+                     redact(text)[:120])
+        return None, text
+
+    @staticmethod
+    def _record_blocker(blk: dict, text: str, action: str, shot) -> None:
+        # 弹窗可能是残留的下单确认框, 正文含股东账号: 落盘/发邮件前脱敏
+        BLOCKER_EVENTS.append({
+            "at": datetime.now().isoformat(timespec="seconds"),
+            "bounds": blk["bounds"], "text": redact(text), "action": action,
+            "shot": shot})
+
+    def _press_ax_safe_button(self, blk: dict) -> tuple[str | None, str]:
+        """弹窗若在 AX 树里(主窗口下的非登录 sheet), 直接 AXPress 白名单按钮。
+
+        比 OCR+坐标点击可靠: 不受截图缩放/坐标换算影响。返回 (按钮名, 文字)。
+        """
+        try:
+            app = AXUIElementCreateApplication(self._pid())
+        except AXError:
+            return None, ""
+        main = self._main_of(app)
+        if main is None:
+            return None, ""
+        bx, by, bw, bh = blk["bounds"]
+        for c in attr(main, "AXChildren") or []:
+            if str(attr(c, "AXRole") or "") != "AXSheet":
+                continue
+            x, y, w, h = geom(c)
+            if abs(w - bw) > 2 or abs(h - bh) > 2:
+                continue
+            texts, buttons = [], {}
+
+            def walk(el, depth=0):
+                if depth > 8:
+                    return
+                role = str(attr(el, "AXRole") or "")
+                t = str(attr(el, "AXValue") or attr(el, "AXTitle") or "").strip()
+                if role == "AXButton" and t:
+                    buttons.setdefault(t, el)
+                elif t:
+                    texts.append(t)
+                for k in attr(el, "AXChildren") or []:
+                    walk(k, depth + 1)
+
+            walk(c)
+            text = " ".join(" ".join(texts).split())[:200]
+            for name in self.SAFE_BUTTONS:
+                if name in buttons:
+                    try:
+                        self.press(buttons[name])
+                    except AXError:
+                        break
+                    _LOG.warning("遮挡弹窗(AX)点击[%s] (正文: %s)", name, redact(text)[:80])
+                    return name, text
+            return None, text
+        return None, ""
+
+    def clear_blocking_window(self, password: str | None) -> tuple[bool, str]:
+        """有遮挡弹窗就截图后清除。返回 (是否已无遮挡, 说明)。
+
+        两级: ① 点白名单里的[取消]/[已知晓]等安全按钮 —— AX 看得见的
+        (主窗口下的 sheet)直接 AXPress, 看不见的截图 OCR 后按坐标点; 一个
+        弹窗点完可能露出下一个, 最多 4 次。② 仍有遮挡、认不出按钮、或疑似
+        交易登录框, 则重启同花顺重登 —— 冷启动+自动登录有演练覆盖, 验证码
+        在登录 sheet 里是明文可读。
+        """
+        blk = self.find_blocking_window()
+        if blk is None:
+            return True, ""
+        if not screen_capture_allowed():
+            _LOG.warning("无屏幕录制权限, 截不到弹窗, 直接重启同花顺")
+        shots, clicked = [], []
+        for _ in range(4):
+            # 先拉到前台: 区域截图截的是屏幕最上层, 被别的 App 盖住会截错
+            self.activate(timeout=3.0)
+            shot = self.capture_window(blk["bounds"])
+            shots.append(shot)
+            # 券商拒单警告框(只有[确认])沿用原处理: 按[确认]即关, 0.4s,
+            # 不能因为它被判成遮挡窗就重启同花顺
+            err = self.dismiss_error_dialog()
+            if err:
+                name, text = "确认", err
+            else:
+                name, text = self._press_ax_safe_button(blk)
+            if name is None:
+                name, ocr_text = self._click_safe_button(blk, shot)
+                text = text or ocr_text
+            self._record_blocker(blk, text, f"点[{name}]" if name else "重启",
+                                 shot)
+            if name is None:
+                break
+            clicked.append(name)
+            # 等弹窗消失; 点掉一个可能露出下一个, 继续处理
+            wait_until(lambda: self.find_blocking_window() is None or None,
+                       timeout=1.5, interval=0.2)
+            blk = self.find_blocking_window()
+            if blk is None:
+                return True, f"已点掉遮挡弹窗{clicked}(截图 {shots})"
+        if clicked:
+            self._record_blocker(blk, "", "点击未清除, 重启", shots[-1])
+        shot = shots[-1] if shots else None
+        _LOG.warning("遮挡弹窗 %s 点击未清除(已点 %s), 截图 %s, 重启同花顺",
+                     blk["bounds"], clicked, shot)
+        if not self.quit_app():
+            return False, f"遮挡弹窗且同花顺退出失败(截图 {shots})"
+        if not self.launch_app():
+            return False, f"遮挡弹窗重启后同花顺拉起失败(截图 {shots})"
+        if password:
+            ok, why = self.login(password)
+            if not ok:
+                return False, f"遮挡弹窗重启后登录失败: {why}(截图 {shots})"
+        if self.find_blocking_window() is not None:
+            return False, f"遮挡弹窗重启后仍在(截图 {shots})"
+        return True, f"已重启清除遮挡弹窗(截图 {shots})"
+
     def dismiss_password_unlock(self) -> bool:
         """误弹「"密码"已锁定」时点[取消]。无人值守时没人按 Touch ID, 不取消
         它会一直挡在登录框上。返回是否取消过。"""
@@ -1177,6 +1567,15 @@ class ThsAX:
         if not (attr(win, "AXChildren") or []):
             return False, "窗口 AX 树为空"
 
+        # AX 看不见的弹窗会锁住主窗口, 但下面每一项检查都照样通过(11-13)。
+        # 放在登录检查之前: 重启后的登录态由下面的分支兜底。
+        try:
+            clear_ok, cleared = self.clear_blocking_window(password)
+        except LoginRefused as e:
+            return False, f"券商拒绝登录: {e}"
+        if not clear_ok:
+            return False, cleared
+
         # 登录态要在读资金之前查 —— 未登录时资金区是空的, 若不先查登录,
         # 报出来的会是"读不到可用金额"这种误导性原因。
         if self.login_sheet() is not None or not self.logged_in():
@@ -1204,7 +1603,14 @@ class ThsAX:
             self.open_orders_tab()
         except AXError as e:
             return False, f"打不开委托表: {e}"
-        return True, f"可用金额 {funds['可用金额']:,.2f}, 导航与委托表均可读"
+        note = f"; {cleared}" if cleared else ""
+        # 其他 App/系统的窗口压在同花顺上: 不自动点, 只在说明里写出来,
+        # 由上层告警。CGEvent 点击会落在它们身上。
+        over = self.find_foreign_overlay()
+        if over:
+            note += "; 有其他窗口压在同花顺上: " + ", ".join(
+                f"{o['owner']}{tuple(int(v) for v in o['bounds'])}" for o in over[:3])
+        return True, f"可用金额 {funds['可用金额']:,.2f}, 导航与委托表均可读{note}"
 
     def available_cash(self, timeout: float = 10.0) -> float | None:
         """可用金额(可立即用于买入的现金)。读不到返回 None。

@@ -129,8 +129,10 @@ class Trader:
         # 每批首次确保前台(缓存命中不再激活): 后台时CGEvent会落到别的App
         self.ax.ensure_frontmost()
         # 已就绪的快路径: 不把每单都拖慢到完整自检(约 2s)
+        # 遮挡弹窗查的是窗口服务器(毫秒级), 有则走完整自检去重启清除
         try:
-            if (self.ax.login_sheet() is None and self.ax.nav_buttons()
+            if (self.ax.find_blocking_window() is None
+                    and self.ax.login_sheet() is None and self.ax.nav_buttons()
                     and "可用金额" in self.ax.read_funds()):
                 self._ready_at = time.time()
                 return True, "已就绪"
@@ -406,6 +408,11 @@ class Trader:
                              interval=0.05)
             if dlg is None:
                 msg = "点击后未出现二次确认框,状态不明,请人工核对"
+                blk = self.ax.find_blocking_window()
+                if blk is not None:
+                    # 下一次尝试走 ready_to_trade, 由它截图并重启清除
+                    msg = f"被同花顺弹窗遮挡{blk['bounds']},确认框无法弹出"
+                    self._ready_at = 0.0
                 self.log.error(msg)
                 return Result(Status.ERROR, side, code, price_str,
                               amount_str, self.ax.read_state(panel), msg,

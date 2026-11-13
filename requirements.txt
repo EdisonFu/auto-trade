@@ -1,3 +1,6 @@
 pyobjc-framework-ApplicationServices>=13.0
 pyobjc-framework-Cocoa>=13.0
 pyobjc-framework-Quartz>=13.0
+# 可选: OCR 遮挡弹窗以点掉[取消]/[已知晓]; 缺失时退回重启同花顺
+pyobjc-framework-Vision>=13.0
+pyobjc-framework-CoreML>=13.0
